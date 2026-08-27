@@ -1,1 +1,53 @@
-# housely-collections-bot
+# Housely Collections Bot — MVP
+
+Bot for compact daily housing collections.
+
+## What it does
+
+- Watches new property posts in `@dublin_rent` and `@irelandrent`.
+- Reads only posts that contain a `Ref`.
+- Extracts Ref, location, price, short description and original post URL.
+- Lets admins create today's collection in private chat.
+- Preview buttons: Publish / Edit / Regenerate / Cancel.
+- Can publish to the main channel, either object channel, or both object channels.
+
+## Important limitation
+
+Telegram Bot API does not backfill old channel history. The bot will only collect posts it receives after it is running in Railway and present in the source channels.
+
+For the first test:
+1. Deploy the bot.
+2. Publish one **new** property post with a `Ref` in `@dublin_rent` or `@irelandrent`.
+3. Send `/start` to the bot in private chat.
+4. Press `📋 Створити підбірку`.
+
+## Railway Variables
+
+Add:
+
+- `BOT_TOKEN`
+- `ADMIN_IDS`
+- `MAIN_CHANNEL=@arpireland1`
+- `DUBLIN_CHANNEL=@dublin_rent`
+- `IRELAND_CHANNEL=@irelandrent`
+- `TIMEZONE=Europe/Dublin`
+- `MAX_ITEMS=25`
+- `DATA_DIR=/app/data`
+
+Multiple admins example:
+
+`ADMIN_IDS=1231023850,987654321`
+
+## Persistent database
+
+The bot uses SQLite at `/app/data/collections.db`.
+
+For persistent storage, add a Railway Volume mounted at:
+
+`/app/data`
+
+Without a Volume, the test database can disappear after redeploy/restart.
+
+## How an employee finds their Telegram ID
+
+Send `/id` to this bot from that Telegram account. The bot replies with that account's own numeric Telegram ID. Add it to `ADMIN_IDS` and redeploy.
