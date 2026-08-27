@@ -183,6 +183,41 @@ def extract_audience(text: str):
     return None
 
 
+def audience_for_collection(audience: str | None):
+    """Shorten audience text for the compact collection card.
+
+    Example:
+    'Для однієї особи або пари з роботою/студент(ка)'
+    -> 'однієї особи або пари'
+    """
+    if not audience:
+        return None
+
+    value = clean_line(audience)
+    value = re.sub(r"^(Для|For)\s+", "", value, flags=re.IGNORECASE).strip()
+
+    cut_patterns = [
+        r"\s+(?:з|із)\s+роботою\b.*$",
+        r"\s+с\s+работой\b.*$",
+        r"\s+with\s+(?:a\s+)?job\b.*$",
+        r"\s*/\s*студент.*$",
+        r"\s+студент(?:ка|\(ка\))?\b.*$",
+        r"\s+student\b.*$",
+    ]
+    for cut_pattern in cut_patterns:
+        value = re.sub(cut_pattern, "", value, flags=re.IGNORECASE).strip()
+
+    value = value.rstrip(" ,;/.-")
+    return value or None
+
+
+def sentence_case(value: str):
+    value = (value or "").strip()
+    if not value:
+        return value
+    return value[0].upper() + value[1:]
+
+
 def extract_description(text: str, location: str | None):
     lines = [clean_line(x) for x in text.splitlines() if clean_line(x)]
     if not lines:
@@ -221,7 +256,7 @@ def extract_description(text: str, location: str | None):
     if len(candidate) > 95:
         candidate = candidate[:92].rstrip() + "…"
 
-    return candidate or "Житло"
+    return sentence_case(candidate or "Житло")
 
 
 def property_icon(description: str):
@@ -230,7 +265,12 @@ def property_icon(description: str):
         return "🚿"
     if any(x in low for x in ("будинок", "дом", "house")):
         return "🏡"
-    if any(x in low for x in ("apartment", "квартира", "studio", "студ")):
+    # Do not use a loose "студ" match: it also matches "студент(ка)".
+    if (
+        "apartment" in low
+        or "квартира" in low
+        or re.search(r"\b(?:studio|студія|студия)\b", low)
+    ):
         return "🏢"
     return "🏠"
 
@@ -245,11 +285,21 @@ def parse_property(text: str):
     audience = extract_audience(text)
     description = extract_description(text, location)
 
-    # Add audience context only when the title is very short.
-    if audience and len(description) < 28:
-        audience_short = re.sub(r"^Для\s+", "", audience, flags=re.IGNORECASE)
-        if audience_short and audience_short.lower() not in description.lower():
-            description = f"{description} для {audience_short[:60]}"
+    # Add audience only when the title is generic.
+    # Job/student requirements stay in the full property post.
+    audience_short = audience_for_collection(audience)
+    generic_titles = {
+        "кімната", "комната", "room",
+        "будинок", "дом", "house",
+        "квартира", "apartment",
+        "студія", "студия", "studio",
+    }
+    if (
+        audience_short
+        and description.strip().lower() in generic_titles
+        and audience_short.lower() not in description.lower()
+    ):
+        description = f"{description} для {audience_short}"
 
     return {
         "ref": ref,
@@ -342,11 +392,22 @@ def get_today_properties():
         ).fetchall()
 
     # If the same Ref was published several times today, keep the latest one.
+    # Re-parse raw_text so formatting improvements apply to already-saved posts too.
     latest_by_ref = {}
     for row in rows:
-        ref = row["ref"] or f"{row['channel_id']}:{row['message_id']}"
+        item = dict(row)
+
+        reparsed = parse_property(item.get("raw_text", ""))
+        if reparsed:
+            item["ref"] = reparsed["ref"]
+            item["location"] = reparsed["location"]
+            item["price"] = reparsed["price"]
+            item["description"] = reparsed["description"]
+            item["audience"] = reparsed["audience"]
+
+        ref = item["ref"] or f"{item['channel_id']}:{item['message_id']}"
         if ref not in latest_by_ref:
-            latest_by_ref[ref] = dict(row)
+            latest_by_ref[ref] = item
 
     result = list(latest_by_ref.values())
     result.sort(key=lambda x: (x["location"].lower(), x["created_at_utc"]))
