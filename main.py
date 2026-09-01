@@ -1,12 +1,15 @@
 import os
 import re
 import html
+import asyncio
 import sqlite3
 import logging
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -41,6 +44,11 @@ SOURCE_CHANNELS = {
 
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Dublin"))
 MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "25"))
+VERIFY_SOURCE_POSTS = os.environ.get("VERIFY_SOURCE_POSTS", "true").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+POST_CHECK_TIMEOUT = float(os.environ.get("POST_CHECK_TIMEOUT", "8"))
+POST_CHECK_CONCURRENCY = max(1, int(os.environ.get("POST_CHECK_CONCURRENCY", "8")))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,41 +191,6 @@ def extract_audience(text: str):
     return None
 
 
-def audience_for_collection(audience: str | None):
-    """Shorten audience text for the compact collection card.
-
-    Example:
-    'Для однієї особи або пари з роботою/студент(ка)'
-    -> 'однієї особи або пари'
-    """
-    if not audience:
-        return None
-
-    value = clean_line(audience)
-    value = re.sub(r"^(Для|For)\s+", "", value, flags=re.IGNORECASE).strip()
-
-    cut_patterns = [
-        r"\s+(?:з|із)\s+роботою\b.*$",
-        r"\s+с\s+работой\b.*$",
-        r"\s+with\s+(?:a\s+)?job\b.*$",
-        r"\s*/\s*студент.*$",
-        r"\s+студент(?:ка|\(ка\))?\b.*$",
-        r"\s+student\b.*$",
-    ]
-    for cut_pattern in cut_patterns:
-        value = re.sub(cut_pattern, "", value, flags=re.IGNORECASE).strip()
-
-    value = value.rstrip(" ,;/.-")
-    return value or None
-
-
-def sentence_case(value: str):
-    value = (value or "").strip()
-    if not value:
-        return value
-    return value[0].upper() + value[1:]
-
-
 def extract_description(text: str, location: str | None):
     lines = [clean_line(x) for x in text.splitlines() if clean_line(x)]
     if not lines:
@@ -256,7 +229,7 @@ def extract_description(text: str, location: str | None):
     if len(candidate) > 95:
         candidate = candidate[:92].rstrip() + "…"
 
-    return sentence_case(candidate or "Житло")
+    return candidate or "Житло"
 
 
 def property_icon(description: str):
@@ -265,12 +238,7 @@ def property_icon(description: str):
         return "🚿"
     if any(x in low for x in ("будинок", "дом", "house")):
         return "🏡"
-    # Do not use a loose "студ" match: it also matches "студент(ка)".
-    if (
-        "apartment" in low
-        or "квартира" in low
-        or re.search(r"\b(?:studio|студія|студия)\b", low)
-    ):
+    if any(x in low for x in ("apartment", "квартира", "studio", "студ")):
         return "🏢"
     return "🏠"
 
@@ -285,21 +253,11 @@ def parse_property(text: str):
     audience = extract_audience(text)
     description = extract_description(text, location)
 
-    # Add audience only when the title is generic.
-    # Job/student requirements stay in the full property post.
-    audience_short = audience_for_collection(audience)
-    generic_titles = {
-        "кімната", "комната", "room",
-        "будинок", "дом", "house",
-        "квартира", "apartment",
-        "студія", "студия", "studio",
-    }
-    if (
-        audience_short
-        and description.strip().lower() in generic_titles
-        and audience_short.lower() not in description.lower()
-    ):
-        description = f"{description} для {audience_short}"
+    # Add audience context only when the title is very short.
+    if audience and len(description) < 28:
+        audience_short = re.sub(r"^Для\s+", "", audience, flags=re.IGNORECASE)
+        if audience_short and audience_short.lower() not in description.lower():
+            description = f"{description} для {audience_short[:60]}"
 
     return {
         "ref": ref,
@@ -378,7 +336,7 @@ def save_channel_post(update: Update):
     return True
 
 
-def get_today_properties():
+def get_today_properties(apply_limit=True):
     today = datetime.now(TZ).date().isoformat()
     with db() as conn:
         rows = conn.execute(
@@ -392,28 +350,111 @@ def get_today_properties():
         ).fetchall()
 
     # If the same Ref was published several times today, keep the latest one.
-    # Re-parse raw_text so formatting improvements apply to already-saved posts too.
     latest_by_ref = {}
     for row in rows:
-        item = dict(row)
-
-        reparsed = parse_property(item.get("raw_text", ""))
-        if reparsed:
-            item["ref"] = reparsed["ref"]
-            item["location"] = reparsed["location"]
-            item["price"] = reparsed["price"]
-            item["description"] = reparsed["description"]
-            item["audience"] = reparsed["audience"]
-
-        ref = item["ref"] or f"{item['channel_id']}:{item['message_id']}"
+        ref = row["ref"] or f"{row['channel_id']}:{row['message_id']}"
         if ref not in latest_by_ref:
-            latest_by_ref[ref] = item
+            latest_by_ref[ref] = dict(row)
 
     result = list(latest_by_ref.values())
     result.sort(key=lambda x: (x["location"].lower(), x["created_at_utc"]))
 
     hidden_count = max(0, len(result) - MAX_ITEMS)
-    return result[:MAX_ITEMS], hidden_count
+    if apply_limit:
+        return result[:MAX_ITEMS], hidden_count
+    return result, 0
+
+
+def classify_post_check_response(status_code: int, response_text: str):
+    """Return True for an existing post, False for a missing post, None if uncertain."""
+    if status_code in (404, 410):
+        return False
+    if status_code < 200 or status_code >= 400:
+        return None
+
+    body = (response_text or "").lower()
+    missing_markers = (
+        "tgme_widget_message_error",
+        "post not found",
+        "message not found",
+        "message_not_found",
+    )
+    if any(marker in body for marker in missing_markers):
+        return False
+
+    existing_markers = (
+        "tgme_widget_message_bubble",
+        "data-post=",
+        "tgme_widget_message_text",
+        "tgme_widget_message_photo_wrap",
+    )
+    if any(marker in body for marker in existing_markers):
+        return True
+
+    # Telegram can temporarily return a generic/anti-bot page. Keep the database
+    # record in that case instead of deleting a valid property by mistake.
+    return None
+
+
+async def check_source_post(item, client: httpx.AsyncClient, semaphore: asyncio.Semaphore):
+    url = item["post_url"]
+    separator = "&" if "?" in url else "?"
+    check_url = f"{url}{separator}embed=1&mode=tme"
+
+    async with semaphore:
+        try:
+            response = await client.get(check_url)
+        except httpx.HTTPError as exc:
+            log.warning("Could not verify %s: %s", url, exc)
+            return None
+
+    return classify_post_check_response(response.status_code, response.text)
+
+
+def delete_property_posts(items):
+    ids = [int(item["id"]) for item in items if item.get("id") is not None]
+    if not ids:
+        return
+
+    placeholders = ",".join("?" for _ in ids)
+    with db() as conn:
+        conn.execute(f"DELETE FROM property_posts WHERE id IN ({placeholders})", ids)
+
+
+async def remove_missing_source_posts(properties):
+    """Live-check public Telegram links and remove definitively missing posts."""
+    if not VERIFY_SOURCE_POSTS or not properties:
+        return properties, []
+
+    timeout = httpx.Timeout(POST_CHECK_TIMEOUT)
+    headers = {"User-Agent": "HouselyCollectionsBot/1.1"}
+    semaphore = asyncio.Semaphore(POST_CHECK_CONCURRENCY)
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        states = await asyncio.gather(
+            *(check_source_post(item, client, semaphore) for item in properties)
+        )
+
+    missing = [item for item, state in zip(properties, states) if state is False]
+    remaining = [item for item, state in zip(properties, states) if state is not False]
+
+    if missing:
+        delete_property_posts(missing)
+        log.info(
+            "Removed %s deleted channel post(s) from the collection database: %s",
+            len(missing),
+            [item["post_url"] for item in missing],
+        )
+
+    return remaining, missing
+
+
+async def get_verified_today_properties():
+    # Check before applying MAX_ITEMS so deleted rows do not occupy visible slots.
+    properties, _ = get_today_properties(apply_limit=False)
+    properties, missing = await remove_missing_source_posts(properties)
+    hidden_count = max(0, len(properties) - MAX_ITEMS)
+    return properties[:MAX_ITEMS], hidden_count, missing
 
 
 # =========================
@@ -451,6 +492,95 @@ def build_collection(properties, hidden_count=0):
         return build_collection(properties[:-1], hidden_count + 1)
 
     return text
+
+
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+DETAILS_RE = re.compile(r"(?:<b>)?Детальніше(?:</b>)?", re.IGNORECASE)
+
+
+def visible_html_text(value: str) -> str:
+    return html.unescape(HTML_TAG_RE.sub("", value or ""))
+
+
+def normalize_match_text(value: str) -> str:
+    value = visible_html_text(value).lower().replace("’", "'")
+    value = re.sub(r"[^\w€]+", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def property_line_plain(item) -> str:
+    return (
+        f"{property_icon(item['description'])} {item['description']} — "
+        f"{item['price']} → Детальніше"
+    )
+
+
+def find_edited_line_property(line: str, properties, used_indexes):
+    normalized_line = normalize_match_text(line)
+    if not normalized_line:
+        return None, None
+
+    best_index = None
+    best_score = 0.0
+    for index, item in enumerate(properties):
+        if index in used_indexes:
+            continue
+
+        expected = normalize_match_text(property_line_plain(item))
+        score = SequenceMatcher(None, normalized_line, expected).ratio()
+
+        description = normalize_match_text(item.get("description", ""))
+        price = normalize_match_text(item.get("price", ""))
+        if description and description in normalized_line:
+            score += 0.7
+        if price and price in normalized_line:
+            score += 0.2
+
+        if score > best_score:
+            best_score = score
+            best_index = index
+
+    # A normal edit only deletes lines, so matching is usually exact. The
+    # threshold avoids attaching a random property link after a full rewrite.
+    if best_index is None or best_score < 0.72:
+        return None, None
+    return best_index, properties[best_index]
+
+
+def restore_missing_detail_links(edited_html: str, properties):
+    """Preserve Telegram text links and rebuild any lost while copy-editing."""
+    used_indexes = set()
+    restored_lines = []
+
+    for line in (edited_html or "").splitlines():
+        visible = visible_html_text(line)
+        if "детальніше" not in visible.lower():
+            restored_lines.append(line)
+            continue
+
+        index, item = find_edited_line_property(line, properties, used_indexes)
+        if item is not None:
+            used_indexes.add(index)
+
+        # text_html already contains the original URL when Telegram preserved
+        # its text_link entity. Do not touch a valid existing anchor.
+        if re.search(r"<a\s+href=", line, flags=re.IGNORECASE):
+            restored_lines.append(line)
+            continue
+
+        if item is None:
+            restored_lines.append(line)
+            continue
+
+        url = html.escape(item["post_url"], quote=True)
+        linked_details = f'<a href="{url}"><b>Детальніше</b></a>'
+        restored_lines.append(DETAILS_RE.sub(linked_details, line, count=1))
+
+    return "\n".join(restored_lines)
+
+
+def properties_rendered_in(text: str, properties):
+    return [item for item in properties if item["post_url"] in text]
 
 
 # =========================
@@ -533,7 +663,7 @@ async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer()
-    properties, hidden_count = get_today_properties()
+    properties, hidden_count, missing = await get_verified_today_properties()
 
     if not properties:
         await q.message.reply_text(
@@ -544,11 +674,18 @@ async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = build_collection(properties, hidden_count)
+    visible_properties = properties_rendered_in(text, properties)
     PREVIEWS[user.id] = {
         "text": text,
-        "properties": properties,
+        "properties": visible_properties,
         "hidden_count": hidden_count,
     }
+
+    if missing:
+        await q.message.reply_text(
+            f"🧹 З підбірки автоматично прибрано {len(missing)} "
+            "видалених постів із каналів."
+        )
 
     await q.message.reply_text(
         text,
@@ -566,17 +703,24 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer("Оновлено")
-    properties, hidden_count = get_today_properties()
+    properties, hidden_count, missing = await get_verified_today_properties()
     if not properties:
         await q.edit_message_text("Сьогодні немає об'єктів для підбірки.")
         return
 
     text = build_collection(properties, hidden_count)
+    visible_properties = properties_rendered_in(text, properties)
     PREVIEWS[user.id] = {
         "text": text,
-        "properties": properties,
+        "properties": visible_properties,
         "hidden_count": hidden_count,
     }
+
+    if missing:
+        await q.message.reply_text(
+            f"🧹 З підбірки автоматично прибрано {len(missing)} "
+            "видалених постів із каналів."
+        )
 
     await q.edit_message_text(
         text,
@@ -610,16 +754,26 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not is_admin(user.id) or user.id not in EDIT_WAITING:
         return
 
-    new_text = (update.effective_message.text or "").strip()
+    message = update.effective_message
+    new_text = (message.text or "").strip()
     if not new_text:
         return
 
     EDIT_WAITING.discard(user.id)
-    safe_text = html.escape(new_text)
-    PREVIEWS.setdefault(user.id, {})["text"] = safe_text
+    preview = PREVIEWS.setdefault(user.id, {})
 
-    await update.effective_message.reply_text(
-        safe_text,
+    # text_html reconstructs Telegram formatting and text_link entities. The
+    # previous implementation escaped message.text, which deliberately turned
+    # every clickable "Детальніше" into plain black text.
+    edited_html = (message.text_html or html.escape(new_text)).strip()
+    edited_html = restore_missing_detail_links(
+        edited_html,
+        preview.get("properties", []),
+    )
+    preview["text"] = edited_html
+
+    await message.reply_text(
+        edited_html,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
         reply_markup=preview_keyboard(),
