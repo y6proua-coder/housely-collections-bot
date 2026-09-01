@@ -190,6 +190,34 @@ class TestCollectionBuilder(unittest.TestCase):
         rendered = main.properties_rendered_in(text, items)
         self.assertEqual([item["id"] for item in rendered], [1])
 
+    def test_collection_contains_mandatory_footer_text(self):
+        text = main.build_collection([property_item(1)])
+        self.assertIn("Переглядай актуальні пропозиції", text)
+        self.assertIn("телеграм каналі:", text)
+
+    def test_footer_channel_url_is_clickable(self):
+        text = main.build_collection([property_item(1)])
+        self.assertIn(
+            '<a href="https://t.me/arpireland1"><b>https://t.me/arpireland1</b></a>',
+            text,
+        )
+
+    def test_footer_is_at_the_very_end(self):
+        text = main.build_collection([property_item(1)])
+        self.assertTrue(text.endswith("⸻"))
+        self.assertGreater(text.rfind("https://t.me/arpireland1"), text.rfind("Детальніше"))
+
+    def test_manual_edit_restores_removed_footer(self):
+        edited = "🏡 Підбірка\n\n• 🏠 Об'єкт — €900 → Детальніше"
+        restored = main.ensure_collection_footer(edited)
+        self.assertTrue(restored.endswith("⸻"))
+        self.assertIn("https://t.me/arpireland1", restored)
+
+    def test_existing_footer_is_not_duplicated(self):
+        text = main.build_collection([property_item(1)])
+        restored = main.ensure_collection_footer(text)
+        self.assertEqual(restored.count("Переглядай актуальні пропозиції"), 1)
+
 
 class TestDatabaseCleanup(unittest.TestCase):
     def setUp(self):

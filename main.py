@@ -36,6 +36,10 @@ ADMIN_IDS = {
 MAIN_CHANNEL = os.environ.get("MAIN_CHANNEL", "@arpireland1").strip()
 DUBLIN_CHANNEL = os.environ.get("DUBLIN_CHANNEL", "@dublin_rent").strip()
 IRELAND_CHANNEL = os.environ.get("IRELAND_CHANNEL", "@irelandrent").strip()
+FOOTER_CHANNEL_URL = os.environ.get(
+    "FOOTER_CHANNEL_URL",
+    f"https://t.me/{MAIN_CHANNEL.lstrip('@')}",
+).strip()
 
 SOURCE_CHANNELS = {
     DUBLIN_CHANNEL.lstrip("@").lower(),
@@ -461,6 +465,25 @@ async def get_verified_today_properties():
 # COLLECTION BUILDER
 # =========================
 
+def build_collection_footer():
+    url = html.escape(FOOTER_CHANNEL_URL, quote=True)
+    label = html.escape(FOOTER_CHANNEL_URL)
+    return (
+        "⸻\n"
+        "<b>Переглядай актуальні пропозиції</b> житла в нашому офіційному "
+        "<b>телеграм каналі:</b>\n\n"
+        f'🔗 <a href="{url}"><b>{label}</b></a>\n'
+        "⸻"
+    )
+
+
+def ensure_collection_footer(text: str) -> str:
+    # The footer remains mandatory even if an admin removes it while editing.
+    if FOOTER_CHANNEL_URL in visible_html_text(text):
+        return text.rstrip()
+    return f"{text.rstrip()}\n\n{build_collection_footer()}"
+
+
 def build_collection(properties, hidden_count=0):
     parts = ["🏡 <b>Актуальне житло на сьогодні</b>", ""]
 
@@ -484,6 +507,8 @@ def build_collection(properties, hidden_count=0):
 
     if hidden_count:
         parts.append(f"➕ Ще {hidden_count} пропозицій не показано в цій підбірці.")
+
+    parts.extend(["", build_collection_footer()])
 
     text = "\n".join(parts).strip()
 
@@ -770,6 +795,7 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         edited_html,
         preview.get("properties", []),
     )
+    edited_html = ensure_collection_footer(edited_html)
     preview["text"] = edited_html
 
     await message.reply_text(

@@ -14,6 +14,8 @@ Bot for compact daily housing collections.
   removes posts that were deleted directly in the channel from SQLite.
 - Keeps `Детальніше` links clickable after manual editing. Telegram link
   entities are preserved; missing entities are rebuilt from the Preview data.
+- Automatically adds the mandatory official-channel footer to the end of every
+  collection and restores it if it was removed during manual editing.
 
 ## Important limitation
 
@@ -32,6 +34,7 @@ Add:
 - `BOT_TOKEN`
 - `ADMIN_IDS`
 - `MAIN_CHANNEL=@arpireland1`
+- `FOOTER_CHANNEL_URL=https://t.me/arpireland1`
 - `DUBLIN_CHANNEL=@dublin_rent`
 - `IRELAND_CHANNEL=@irelandrent`
 - `TIMEZONE=Europe/Dublin`
