@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="housely-collections-tests-")
@@ -12,7 +13,14 @@ os.environ["VERIFY_SOURCE_POSTS"] = "true"
 import main
 
 
-def property_item(index, description=None, price=None, location="Dublin 1"):
+def property_item(
+    index,
+    description=None,
+    price=None,
+    location="Dublin 1",
+    audience=None,
+    property_type=None,
+):
     return {
         "id": index,
         "channel_id": -1001,
@@ -21,6 +29,8 @@ def property_item(index, description=None, price=None, location="Dublin 1"):
         "location": location,
         "price": price or f"€{900 + index:,}",
         "description": description or f"Кімната номер {index}",
+        "property_type": property_type,
+        "audience": audience,
         "post_url": f"https://t.me/dublin_rent/{100 + index}",
         "created_at_utc": f"2026-09-01T10:{index:02d}:00+00:00",
     }
@@ -93,8 +103,40 @@ class TestParsing(unittest.TestCase):
     def test_price_euro_suffix(self):
         self.assertEqual(main.extract_price("Оренда: 1250€"), "€1,250")
 
+    def test_price_uses_cost_field_instead_of_earlier_arp_amount(self):
+        text = "АРП: €600\n💶 Вартість: €1,450/місяць"
+        self.assertEqual(main.extract_price(text), "€1,450")
+
     def test_parse_requires_ref(self):
         self.assertIsNone(main.parse_property("Кімната в Dublin 1 — €900"))
+
+    def test_marketing_title_becomes_only_room_type(self):
+        parsed = main.parse_property(
+            "🏠 Кімната з класним власним санвузлом\n"
+            "📍 Локація: Dublin 15\n"
+            "👤 Для кого: пари\n"
+            "💶 Оренда: €1200\n"
+            "Ref 858"
+        )
+        self.assertEqual(parsed["property_type"], "Кімната")
+        self.assertEqual(parsed["audience"], "пари")
+
+    def test_apartment_is_not_misread_from_bedroom(self):
+        self.assertEqual(
+            main.extract_property_type("2-bedroom apartment in Dublin 2"),
+            "Квартира",
+        )
+
+    def test_display_title_has_type_then_audience(self):
+        item = property_item(
+            1,
+            "Кімната з власним санвузлом",
+            audience="Для кого: однієї людини з роботою",
+        )
+        self.assertEqual(
+            main.property_display_title(item),
+            "Кімната для однієї людини з роботою",
+        )
 
 
 class TestLinkRestoration(unittest.TestCase):
@@ -178,7 +220,39 @@ class TestCollectionBuilder(unittest.TestCase):
 
     def test_collection_escapes_description(self):
         text = main.build_collection([property_item(1, "Room & ensuite <new>")])
-        self.assertIn("Room &amp; ensuite &lt;new&gt;", text)
+        self.assertNotIn("ensuite", text)
+        self.assertIn("Кімната", text)
+
+    def test_collection_uses_compact_type_and_audience(self):
+        item = property_item(
+            1,
+            "Кімната з класним санвузлом",
+            audience="пари",
+        )
+        text = main.build_collection([item])
+        self.assertIn("Кімната для пари — <b>€901</b>", text)
+        self.assertNotIn("класним санвузлом", text)
+
+    def test_collection_groups_types_with_rooms_before_houses(self):
+        house = property_item(
+            1,
+            "Будинок",
+            location="Dublin 1",
+            property_type="Будинок",
+        )
+        room = property_item(
+            2,
+            "Кімната",
+            location="Dublin 24",
+            property_type="Кімната",
+        )
+        text = main.build_collection([house, room])
+        self.assertLess(text.index("<b>Кімнати</b>"), text.index("<b>Будинки</b>"))
+        self.assertLess(text.index("Dublin 24"), text.index("Dublin 1"))
+
+    def test_new_collection_has_distinct_title(self):
+        text = main.build_collection([property_item(1)], mode="new")
+        self.assertIn("Нові актуальні пропозиції", text)
 
     def test_collection_shows_hidden_count(self):
         text = main.build_collection([property_item(1)], hidden_count=4)
@@ -245,7 +319,8 @@ class TestDatabaseCleanup(unittest.TestCase):
                 (
                     "dublin_rent", item["channel_id"], item["message_id"],
                     item["ref"], item["location"], item["price"],
-                    item["description"], None, item["post_url"], "raw",
+                    item["description"], item.get("audience"), item["post_url"],
+                    item.get("description", "raw"),
                     local_date, now, now,
                 ),
             )
@@ -266,6 +341,183 @@ class TestDatabaseCleanup(unittest.TestCase):
         self.insert_item(second)
         rows, _ = main.get_today_properties(apply_limit=False)
         self.assertEqual(len(rows), 1)
+
+    def test_published_items_are_excluded_from_new_collection(self):
+        item = property_item(1)
+        self.insert_item(item)
+        rows, _ = main.get_uncollected_properties(apply_limit=False)
+        publication_id = main.record_publication(
+            123,
+            "new",
+            "text",
+            rows,
+            [{"destination": "@main", "chat_id": -1009, "message_id": 55}],
+        )
+        self.assertIsInstance(publication_id, int)
+        remaining, _ = main.get_uncollected_properties(apply_limit=False)
+        self.assertEqual(remaining, [])
+
+    def test_undo_makes_items_new_again(self):
+        item = property_item(1)
+        self.insert_item(item)
+        rows, _ = main.get_uncollected_properties(apply_limit=False)
+        publication_id = main.record_publication(
+            123,
+            "today",
+            "text",
+            rows,
+            [{"destination": "@main", "chat_id": -1009, "message_id": 56}],
+        )
+        message = main.get_active_publication_messages(publication_id)[0]
+        main.mark_publication_message_deleted(message["id"])
+        self.assertTrue(main.finish_publication_undo(publication_id))
+        remaining, _ = main.get_uncollected_properties(apply_limit=False)
+        self.assertEqual([row["ref"] for row in remaining], [item["ref"]])
+
+
+class TestDatabaseMigration(unittest.TestCase):
+    def test_existing_database_is_migrated_without_losing_posts(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        old_db_path = main.DB_PATH
+        main.DB_PATH = Path(temp_dir.name) / "collections.db"
+        try:
+            conn = sqlite3.connect(main.DB_PATH)
+            conn.execute(
+                """
+                CREATE TABLE property_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_username TEXT NOT NULL,
+                    channel_id INTEGER,
+                    message_id INTEGER NOT NULL,
+                    ref TEXT,
+                    location TEXT,
+                    price TEXT,
+                    description TEXT,
+                    audience TEXT,
+                    post_url TEXT NOT NULL,
+                    raw_text TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    UNIQUE(channel_id, message_id)
+                )
+                """
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT INTO property_posts (
+                    channel_username, channel_id, message_id, ref, location,
+                    price, description, audience, post_url, raw_text,
+                    local_date, created_at_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "irelandrent", -1001, 5, "0000005", "Dublin 5", "€1,000",
+                    "Кімната з балконом", "пари", "https://t.me/irelandrent/5",
+                    "Кімната з балконом\nRef 5", "2026-09-03", now, now,
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            main.init_db()
+            with main.db() as migrated:
+                row = migrated.execute(
+                    "SELECT property_type FROM property_posts WHERE ref = '0000005'"
+                ).fetchone()
+                publication_table = migrated.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table' AND name = 'collection_publications'
+                    """
+                ).fetchone()
+            self.assertEqual(row["property_type"], "Кімната")
+            self.assertIsNotNone(publication_table)
+        finally:
+            main.DB_PATH = old_db_path
+            temp_dir.cleanup()
+
+
+class TestFormattingRestoration(unittest.TestCase):
+    def test_plain_copied_collection_restores_links_and_all_standard_bold(self):
+        item = property_item(1, audience="пари")
+        plain = "\n".join([
+            "🏡 Актуальне житло на сьогодні",
+            "🏠 Кімнати",
+            "📍 Dublin 1",
+            "• 🏠 Кімната для пари — €901 → Детальніше",
+            "⸻",
+            "Переглядай актуальні пропозиції житла в нашому офіційному телеграм каналі:",
+            "https://t.me/arpireland1",
+            "⸻",
+        ])
+        restored = main.restore_missing_detail_links(plain, [item])
+        restored = main.restore_standard_collection_formatting(restored, [item])
+        restored = main.ensure_collection_footer(restored)
+        self.assertIn("🏡 <b>Актуальне житло на сьогодні</b>", restored)
+        self.assertIn("🏠 <b>Кімнати</b>", restored)
+        self.assertIn("📍 <b>Dublin 1</b>", restored)
+        self.assertIn("<b>€901</b>", restored)
+        self.assertIn(
+            '<a href="https://t.me/dublin_rent/101"><b>Детальніше</b></a>',
+            restored,
+        )
+        self.assertEqual(restored.count("Переглядай актуальні пропозиції"), 1)
+
+    def test_existing_manual_bold_is_preserved(self):
+        item = property_item(1)
+        line = (
+            "• 🏠 <b>Кімната</b> — <b>€901</b> → "
+            '<a href="https://t.me/dublin_rent/101"><b>Детальніше</b></a>'
+        )
+        restored = main.restore_standard_collection_formatting(line, [item])
+        self.assertEqual(restored, line)
+
+
+class TestUndoPublicationHandler(unittest.IsolatedAsyncioTestCase):
+    async def test_undo_deletes_every_published_message(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        old_db_path = main.DB_PATH
+        main.DB_PATH = Path(temp_dir.name) / "collections.db"
+        main.init_db()
+        try:
+            publication_id = main.record_publication(
+                123,
+                "new",
+                "text",
+                [property_item(1)],
+                [
+                    {"destination": "@one", "chat_id": -1001, "message_id": 10},
+                    {"destination": "@two", "chat_id": -1002, "message_id": 20},
+                ],
+            )
+            query = SimpleNamespace(
+                data=f"undo_publish:{publication_id}",
+                answer=AsyncMock(),
+                edit_message_text=AsyncMock(),
+                message=SimpleNamespace(reply_text=AsyncMock()),
+            )
+            update = SimpleNamespace(
+                callback_query=query,
+                effective_user=SimpleNamespace(id=123),
+            )
+            context = SimpleNamespace(
+                bot=SimpleNamespace(delete_message=AsyncMock()),
+            )
+            old_admin_ids = main.ADMIN_IDS
+            main.ADMIN_IDS = {123}
+            try:
+                await main.undo_publication(update, context)
+            finally:
+                main.ADMIN_IDS = old_admin_ids
+
+            self.assertEqual(context.bot.delete_message.await_count, 2)
+            self.assertEqual(main.get_active_publication_messages(publication_id), [])
+            query.edit_message_text.assert_awaited_once()
+        finally:
+            main.DB_PATH = old_db_path
+            temp_dir.cleanup()
 
 
 class TestAsyncSourceChecks(unittest.IsolatedAsyncioTestCase):

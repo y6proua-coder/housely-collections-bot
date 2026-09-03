@@ -92,6 +92,7 @@ def init_db():
                 location TEXT,
                 price TEXT,
                 description TEXT,
+                property_type TEXT,
                 audience TEXT,
                 post_url TEXT NOT NULL,
                 raw_text TEXT NOT NULL,
@@ -108,6 +109,84 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_property_posts_ref ON property_posts(ref)"
         )
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(property_posts)")
+        }
+        if "property_type" not in columns:
+            conn.execute("ALTER TABLE property_posts ADD COLUMN property_type TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bot_settings (key, value)
+            VALUES ('new_collections_tracking_started_at_utc', ?)
+            """,
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collection_publications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                text_html TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL,
+                deleted_at_utc TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collection_publication_items (
+                publication_id INTEGER NOT NULL,
+                ref TEXT NOT NULL,
+                post_url TEXT NOT NULL,
+                PRIMARY KEY (publication_id, ref)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_collection_items_ref
+            ON collection_publication_items(ref)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collection_publication_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                publication_id INTEGER NOT NULL,
+                destination TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                deleted_at_utc TEXT,
+                UNIQUE(chat_id, message_id)
+            )
+            """
+        )
+
+        # Existing Railway volumes predate the property_type column. Backfill
+        # once so their saved posts immediately use the new compact titles.
+        rows = conn.execute(
+            """
+            SELECT id, raw_text, description
+            FROM property_posts
+            WHERE property_type IS NULL OR property_type = ''
+            """
+        ).fetchall()
+        for row in rows:
+            source = row["raw_text"] or row["description"] or ""
+            conn.execute(
+                "UPDATE property_posts SET property_type = ? WHERE id = ?",
+                (extract_property_type(source), row["id"]),
+            )
 
 
 # =========================
@@ -115,7 +194,7 @@ def init_db():
 # =========================
 
 EMOJI_PREFIX_RE = re.compile(
-    r"^[\s🔥🏡🏠📍🗺🚫💶👤🔧🚿💡📌💰🤝📝🔗👀🐶🐱⭐️•\-–—]+"
+    r"^[\s🔥🏡🏠🏢🛏📍🗺🚫💶👤👥👫👩👨🔧🚿💡📌💰🤝📝🔗👀🐶🐱⭐️•\-–—]+"
 )
 
 
@@ -177,7 +256,10 @@ def normalize_price(value: str):
 def extract_price(text: str):
     value = extract_labeled_value(
         text,
-        [r"Оренда", r"Аренда", r"Rent", r"Ціна", r"Цена", r"Price"],
+        [
+            r"Оренда", r"Аренда", r"Rent", r"Ціна", r"Цена", r"Price",
+            r"Вартість", r"Стоимость", r"Cost",
+        ],
     )
     if value:
         return normalize_price(value)
@@ -187,12 +269,111 @@ def extract_price(text: str):
 
 
 def extract_audience(text: str):
+    labeled = extract_labeled_value(
+        text,
+        [
+            r"Для кого(?:\s+підходить)?",
+            r"Кому(?:\s+підходить)?",
+            r"Подходит для кого",
+            r"Suitable for",
+        ],
+    )
+    if labeled:
+        return labeled[:120]
+
     for raw in text.splitlines():
         line = clean_line(raw)
-        low = line.lower()
-        if low.startswith("для ") or low.startswith("for "):
-            return line[:120]
+        m = re.match(r"^(?:Для|For)\s+(.+)$", line, re.IGNORECASE)
+        if m:
+            return clean_line(m.group(1))[:120]
     return None
+
+
+PROPERTY_TYPE_PATTERNS = (
+    ("Ліжко-місце", (r"ліжко[\s-]*місце", r"койко[\s-]*место", r"\bbed\s*space\b")),
+    ("Студія", (r"студі[яї]", r"студи[яи]", r"\bstudio\b")),
+    ("Квартира", (r"квартир[аиуиі]", r"апартамент[иыа]?", r"\bapartment\b", r"\bflat\b")),
+    ("Будинок", (r"будинок", r"будинк[уа]", r"\bдом\b", r"\bhouse\b")),
+    ("Кімната", (r"кімнат[аиуиі]", r"комнат[аыуе]", r"\broom\b")),
+)
+
+PROPERTY_TYPE_ORDER = {
+    "Кімната": 0,
+    "Ліжко-місце": 1,
+    "Квартира": 2,
+    "Студія": 3,
+    "Будинок": 4,
+    "Житло": 5,
+}
+
+PROPERTY_TYPE_SECTIONS = {
+    "Кімната": ("🏠", "Кімнати"),
+    "Ліжко-місце": ("🛏", "Ліжко-місця"),
+    "Квартира": ("🏢", "Квартири"),
+    "Студія": ("🏢", "Студії"),
+    "Будинок": ("🏡", "Будинки"),
+    "Житло": ("🏠", "Інше житло"),
+}
+
+
+def extract_property_type(text: str):
+    """Return only the canonical object type, never the full marketing title."""
+    lines = [clean_line(line) for line in (text or "").splitlines() if clean_line(line)]
+    for line in lines:
+        matches = []
+        for property_type, patterns in PROPERTY_TYPE_PATTERNS:
+            for pattern in patterns:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    matches.append((match.start(), property_type))
+                    break
+        if matches:
+            matches.sort(key=lambda match: (match[0], PROPERTY_TYPE_ORDER[match[1]]))
+            return matches[0][1]
+    return "Житло"
+
+
+def normalize_audience(value: str | None):
+    value = clean_line(value or "")
+    value = re.sub(
+        r"^(?:Для кого(?:\s+підходить)?|Кому(?:\s+підходить)?|Подходит для кого|Suitable for)\s*:\s*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip(" .,-–—")
+    value = re.sub(r"^(?:для|for)\s+", "", value, flags=re.IGNORECASE).strip()
+    if not value:
+        return None
+    return value[0].lower() + value[1:]
+
+
+def item_property_type(item):
+    value = item.get("property_type") if hasattr(item, "get") else None
+    if value in PROPERTY_TYPE_ORDER:
+        return value
+    source = " ".join(
+        str(part or "")
+        for part in (
+            item.get("description", ""),
+            item.get("raw_text", ""),
+        )
+    )
+    return extract_property_type(source)
+
+
+def property_display_title(item):
+    property_type = item_property_type(item)
+    audience = normalize_audience(item.get("audience"))
+    return f"{property_type} для {audience}" if audience else property_type
+
+
+def collection_sort_key(item):
+    property_type = item_property_type(item)
+    return (
+        PROPERTY_TYPE_ORDER.get(property_type, 99),
+        (item.get("location") or "").lower(),
+        item.get("created_at_utc") or "",
+    )
 
 
 def extract_description(text: str, location: str | None):
@@ -247,6 +428,10 @@ def property_icon(description: str):
     return "🏠"
 
 
+def property_type_icon(item):
+    return PROPERTY_TYPE_SECTIONS[item_property_type(item)][0]
+
+
 def parse_property(text: str):
     ref = extract_ref(text)
     if not ref:
@@ -256,18 +441,14 @@ def parse_property(text: str):
     price = extract_price(text) or "Ціна в пості"
     audience = extract_audience(text)
     description = extract_description(text, location)
-
-    # Add audience context only when the title is very short.
-    if audience and len(description) < 28:
-        audience_short = re.sub(r"^Для\s+", "", audience, flags=re.IGNORECASE)
-        if audience_short and audience_short.lower() not in description.lower():
-            description = f"{description} для {audience_short[:60]}"
+    property_type = extract_property_type(text)
 
     return {
         "ref": ref,
         "location": location,
         "price": price,
         "description": description,
+        "property_type": property_type,
         "audience": audience,
     }
 
@@ -303,16 +484,17 @@ def save_channel_post(update: Update):
             """
             INSERT INTO property_posts (
                 channel_username, channel_id, message_id,
-                ref, location, price, description, audience,
+                ref, location, price, description, property_type, audience,
                 post_url, raw_text, local_date,
                 created_at_utc, updated_at_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id, message_id) DO UPDATE SET
                 ref=excluded.ref,
                 location=excluded.location,
                 price=excluded.price,
                 description=excluded.description,
+                property_type=excluded.property_type,
                 audience=excluded.audience,
                 post_url=excluded.post_url,
                 raw_text=excluded.raw_text,
@@ -327,6 +509,7 @@ def save_channel_post(update: Update):
                 parsed["location"],
                 parsed["price"],
                 parsed["description"],
+                parsed["property_type"],
                 parsed["audience"],
                 post_url,
                 text,
@@ -338,6 +521,27 @@ def save_channel_post(update: Update):
 
     log.info("Saved Ref %s from @%s/%s", parsed["ref"], username, msg.message_id)
     return True
+
+
+def _deduplicate_and_sort(rows):
+    """Keep the newest post for each Ref and group the result by object type."""
+    latest_by_ref = {}
+    for row in rows:
+        item = dict(row)
+        ref = item["ref"] or f"{item['channel_id']}:{item['message_id']}"
+        if ref not in latest_by_ref:
+            latest_by_ref[ref] = item
+
+    result = list(latest_by_ref.values())
+    result.sort(key=collection_sort_key)
+    return result
+
+
+def _with_limit(properties, apply_limit=True):
+    hidden_count = max(0, len(properties) - MAX_ITEMS)
+    if apply_limit:
+        return properties[:MAX_ITEMS], hidden_count
+    return properties, 0
 
 
 def get_today_properties(apply_limit=True):
@@ -353,20 +557,143 @@ def get_today_properties(apply_limit=True):
             (today,),
         ).fetchall()
 
-    # If the same Ref was published several times today, keep the latest one.
-    latest_by_ref = {}
-    for row in rows:
-        ref = row["ref"] or f"{row['channel_id']}:{row['message_id']}"
-        if ref not in latest_by_ref:
-            latest_by_ref[ref] = dict(row)
+    return _with_limit(_deduplicate_and_sort(rows), apply_limit)
 
-    result = list(latest_by_ref.values())
-    result.sort(key=lambda x: (x["location"].lower(), x["created_at_utc"]))
 
-    hidden_count = max(0, len(result) - MAX_ITEMS)
-    if apply_limit:
-        return result[:MAX_ITEMS], hidden_count
-    return result, 0
+def get_setting(key: str):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+    return row["value"] if row else None
+
+
+def get_uncollected_properties(apply_limit=True):
+    """Return posts not present in any collection that is still published."""
+    tracking_started_at = get_setting("new_collections_tracking_started_at_utc")
+    if not tracking_started_at:
+        tracking_started_at = datetime.now(timezone.utc).isoformat()
+
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT pp.*
+            FROM property_posts AS pp
+            WHERE pp.created_at_utc >= ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM collection_publication_items AS cpi
+                  JOIN collection_publications AS cp
+                    ON cp.id = cpi.publication_id
+                  WHERE cpi.ref = pp.ref
+                    AND cp.deleted_at_utc IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM collection_publication_messages AS cpm
+                        WHERE cpm.publication_id = cp.id
+                          AND cpm.deleted_at_utc IS NULL
+                    )
+              )
+            ORDER BY pp.created_at_utc DESC
+            """,
+            (tracking_started_at,),
+        ).fetchall()
+
+    return _with_limit(_deduplicate_and_sort(rows), apply_limit)
+
+
+def record_publication(admin_user_id: int, mode: str, text_html: str, properties, messages):
+    """Persist one publish action so it can be undone and excluded from New."""
+    now_utc = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO collection_publications (
+                admin_user_id, mode, text_html, created_at_utc
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (admin_user_id, mode, text_html, now_utc),
+        )
+        publication_id = cursor.lastrowid
+
+        for item in properties:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO collection_publication_items (
+                    publication_id, ref, post_url
+                ) VALUES (?, ?, ?)
+                """,
+                (publication_id, item["ref"], item["post_url"]),
+            )
+
+        for message in messages:
+            conn.execute(
+                """
+                INSERT INTO collection_publication_messages (
+                    publication_id, destination, chat_id, message_id
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    publication_id,
+                    message["destination"],
+                    message["chat_id"],
+                    message["message_id"],
+                ),
+            )
+    return publication_id
+
+
+def get_active_publication_messages(publication_id: int):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT cpm.*
+            FROM collection_publication_messages AS cpm
+            JOIN collection_publications AS cp ON cp.id = cpm.publication_id
+            WHERE cpm.publication_id = ?
+              AND cp.deleted_at_utc IS NULL
+              AND cpm.deleted_at_utc IS NULL
+            ORDER BY cpm.id
+            """,
+            (publication_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_publication_message_deleted(message_row_id: int):
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE collection_publication_messages
+            SET deleted_at_utc = ?
+            WHERE id = ? AND deleted_at_utc IS NULL
+            """,
+            (datetime.now(timezone.utc).isoformat(), message_row_id),
+        )
+
+
+def finish_publication_undo(publication_id: int):
+    """Close a publication only after every Telegram copy has been deleted."""
+    with db() as conn:
+        active_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM collection_publication_messages
+            WHERE publication_id = ? AND deleted_at_utc IS NULL
+            """,
+            (publication_id,),
+        ).fetchone()["count"]
+        if active_count == 0:
+            conn.execute(
+                """
+                UPDATE collection_publications
+                SET deleted_at_utc = ?
+                WHERE id = ? AND deleted_at_utc IS NULL
+                """,
+                (datetime.now(timezone.utc).isoformat(), publication_id),
+            )
+    return active_count == 0
 
 
 def classify_post_check_response(status_code: int, response_text: str):
@@ -461,6 +788,20 @@ async def get_verified_today_properties():
     return properties[:MAX_ITEMS], hidden_count, missing
 
 
+async def get_verified_uncollected_properties():
+    # Hidden objects stay uncollected and appear on the next New collection.
+    properties, _ = get_uncollected_properties(apply_limit=False)
+    properties, missing = await remove_missing_source_posts(properties)
+    hidden_count = max(0, len(properties) - MAX_ITEMS)
+    return properties[:MAX_ITEMS], hidden_count, missing
+
+
+async def get_verified_properties(mode: str):
+    if mode == "new":
+        return await get_verified_uncollected_properties()
+    return await get_verified_today_properties()
+
+
 # =========================
 # COLLECTION BUILDER
 # =========================
@@ -478,32 +819,71 @@ def build_collection_footer():
 
 
 def ensure_collection_footer(text: str) -> str:
-    # The footer remains mandatory even if an admin removes it while editing.
-    if FOOTER_CHANNEL_URL in visible_html_text(text):
-        return text.rstrip()
-    return f"{text.rstrip()}\n\n{build_collection_footer()}"
+    """Replace a copied/plain footer with the canonical linked, bold version."""
+    canonical_footer = build_collection_footer()
+    if (text or "").rstrip().endswith(canonical_footer):
+        return (text or "").rstrip()
+
+    lines = (text or "").splitlines()
+    footer_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if (
+            "переглядай актуальні пропозиції" in visible_html_text(line).lower()
+            or FOOTER_CHANNEL_URL in visible_html_text(line)
+        )
+    ]
+    if footer_indexes:
+        start = min(footer_indexes)
+        while start > 0 and not visible_html_text(lines[start - 1]).strip():
+            start -= 1
+        if start > 0 and visible_html_text(lines[start - 1]).strip() == "⸻":
+            start -= 1
+        text = "\n".join(lines[:start]).rstrip()
+    else:
+        text = (text or "").rstrip()
+    return f"{text}\n\n{canonical_footer}" if text else canonical_footer
 
 
-def build_collection(properties, hidden_count=0):
-    parts = ["🏡 <b>Актуальне житло на сьогодні</b>", ""]
+def build_collection(properties, hidden_count=0, mode="today"):
+    title = (
+        "🆕 <b>Нові актуальні пропозиції</b>"
+        if mode == "new"
+        else "🏡 <b>Актуальне житло на сьогодні</b>"
+    )
+    parts = [title, ""]
 
-    by_location = {}
+    by_type = {}
     for item in properties:
-        by_location.setdefault(item["location"], []).append(item)
+        by_type.setdefault(item_property_type(item), []).append(item)
 
-    for location in sorted(by_location.keys(), key=lambda x: x.lower()):
-        parts.append(f"📍 <b>{html.escape(location)}</b>")
+    for property_type in sorted(
+        by_type,
+        key=lambda value: PROPERTY_TYPE_ORDER.get(value, 99),
+    ):
+        section_icon, section_title = PROPERTY_TYPE_SECTIONS.get(
+            property_type,
+            PROPERTY_TYPE_SECTIONS["Житло"],
+        )
+        parts.append(f"{section_icon} <b>{html.escape(section_title)}</b>")
 
-        for item in by_location[location]:
-            icon = property_icon(item["description"])
-            description = html.escape(item["description"])
-            price = html.escape(item["price"])
-            url = html.escape(item["post_url"], quote=True)
-            parts.append(
-                f"• {icon} {description} — <b>{price}</b> → "
-                f'<a href="{url}"><b>Детальніше</b></a>'
-            )
-        parts.append("")
+        by_location = {}
+        for item in by_type[property_type]:
+            by_location.setdefault(item["location"], []).append(item)
+
+        for location in sorted(by_location.keys(), key=lambda value: value.lower()):
+            parts.append(f"📍 <b>{html.escape(location)}</b>")
+
+            for item in by_location[location]:
+                icon = property_type_icon(item)
+                description = html.escape(property_display_title(item))
+                price = html.escape(item["price"])
+                url = html.escape(item["post_url"], quote=True)
+                parts.append(
+                    f"• {icon} {description} — <b>{price}</b> → "
+                    f'<a href="{url}"><b>Детальніше</b></a>'
+                )
+            parts.append("")
 
     if hidden_count:
         parts.append(f"➕ Ще {hidden_count} пропозицій не показано в цій підбірці.")
@@ -514,7 +894,7 @@ def build_collection(properties, hidden_count=0):
 
     # Keep well below Telegram's 4096-character limit.
     if len(text) > 3900 and len(properties) > 1:
-        return build_collection(properties[:-1], hidden_count + 1)
+        return build_collection(properties[:-1], hidden_count + 1, mode=mode)
 
     return text
 
@@ -535,7 +915,7 @@ def normalize_match_text(value: str) -> str:
 
 def property_line_plain(item) -> str:
     return (
-        f"{property_icon(item['description'])} {item['description']} — "
+        f"{property_type_icon(item)} {property_display_title(item)} — "
         f"{item['price']} → Детальніше"
     )
 
@@ -604,6 +984,72 @@ def restore_missing_detail_links(edited_html: str, properties):
     return "\n".join(restored_lines)
 
 
+def _ensure_bold_fragment(line: str, fragment: str):
+    escaped = html.escape(fragment)
+    bold_pattern = rf"<(?:b|strong)>\s*{re.escape(escaped)}\s*</(?:b|strong)>"
+    if re.search(bold_pattern, line, re.IGNORECASE):
+        return line
+    return line.replace(escaped, f"<b>{escaped}</b>", 1)
+
+
+def _bold_whole_label(visible_line: str):
+    match = re.match(r"^(\S+)\s+(.+)$", visible_line.strip())
+    if not match:
+        return html.escape(visible_line.strip())
+    return f"{html.escape(match.group(1))} <b>{html.escape(match.group(2))}</b>"
+
+
+def restore_standard_collection_formatting(edited_html: str, properties):
+    """Restore generated bold fields after Telegram/plain-text copy editing."""
+    used_indexes = set()
+    restored_lines = []
+    section_labels = {
+        f"{icon} {title}".lower()
+        for icon, title in PROPERTY_TYPE_SECTIONS.values()
+    }
+
+    for line_number, line in enumerate((edited_html or "").splitlines()):
+        visible = visible_html_text(line).strip()
+        low = visible.lower()
+
+        if not visible:
+            restored_lines.append(line)
+            continue
+
+        if line_number == 0 and (
+            "актуальне житло" in low or "нові актуальні пропозиції" in low
+        ):
+            restored_lines.append(_bold_whole_label(visible))
+            continue
+
+        if low in section_labels:
+            restored_lines.append(_bold_whole_label(visible))
+            continue
+
+        if visible.startswith("📍"):
+            restored_lines.append(_bold_whole_label(visible))
+            continue
+
+        if "детальніше" in low:
+            index, item = find_edited_line_property(line, properties, used_indexes)
+            if item is not None:
+                used_indexes.add(index)
+                line = _ensure_bold_fragment(line, item["price"])
+
+            # Keep any existing URL/entity but make the visible CTA bold.
+            line = re.sub(
+                r'(<a\s+[^>]*href="[^"]+"[^>]*>)\s*(?:<b>)?Детальніше(?:</b>)?\s*(</a>)',
+                r"\1<b>Детальніше</b>\2",
+                line,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        restored_lines.append(line)
+
+    return "\n".join(restored_lines)
+
+
 def properties_rendered_in(text: str, properties):
     return [item for item in properties if item["post_url"] in text]
 
@@ -618,7 +1064,8 @@ def is_admin(user_id: int) -> bool:
 
 def home_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Створити підбірку", callback_data="create_today")]
+        [InlineKeyboardButton("📅 Підбірка за сьогодні", callback_data="create_today")],
+        [InlineKeyboardButton("🆕 Тільки нові об'єкти", callback_data="create_new")],
     ])
 
 
@@ -652,6 +1099,18 @@ def other_channels_keyboard():
     ])
 
 
+def published_keyboard(publication_id: int):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "↩️ Скасувати й видалити публікацію",
+                callback_data=f"undo_publish:{publication_id}",
+            )
+        ],
+        [InlineKeyboardButton("🏠 На головну", callback_data="back_home")],
+    ])
+
+
 async def deny(update: Update):
     if update.callback_query:
         await update.callback_query.answer("Немає доступу.", show_alert=True)
@@ -668,7 +1127,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Housely Collections Bot\n\n"
         "Бот збирає нові об'єкти з @dublin_rent та @irelandrent "
-        "і формує компактну підбірку за сьогодні.",
+        "і формує компактні підбірки за сьогодні або тільки з об'єктів, "
+        "які ще не входили до опублікованої підбірки.",
         reply_markup=home_keyboard(),
     )
 
@@ -680,7 +1140,7 @@ async def debug_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"Ваш Telegram ID: {user.id}")
 
 
-async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def create_collection_preview(update: Update, mode: str):
     q = update.callback_query
     user = update.effective_user
     if not user or not is_admin(user.id):
@@ -688,22 +1148,34 @@ async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer()
-    properties, hidden_count, missing = await get_verified_today_properties()
+    properties, hidden_count, missing = await get_verified_properties(mode)
 
     if not properties:
+        if mode == "new":
+            empty_text = (
+                "Нових об'єктів після останньої опублікованої підбірки поки немає.\n\n"
+                "Об'єкт вважається використаним тільки після успішної публікації, "
+                "а не після створення Preview."
+            )
+        else:
+            empty_text = (
+                "Сьогодні я ще не бачив жодного нового об'єкта.\n\n"
+                "Важливо: бот бачить тільки пости, опубліковані після того, "
+                "як він був запущений і доданий у канал."
+            )
         await q.message.reply_text(
-            "Сьогодні я ще не бачив жодного нового об'єкта.\n\n"
-            "Важливо: бот бачить тільки пости, опубліковані після того, "
-            "як він був запущений і доданий у канал."
+            empty_text,
+            reply_markup=home_keyboard(),
         )
         return
 
-    text = build_collection(properties, hidden_count)
+    text = build_collection(properties, hidden_count, mode=mode)
     visible_properties = properties_rendered_in(text, properties)
     PREVIEWS[user.id] = {
         "text": text,
         "properties": visible_properties,
         "hidden_count": hidden_count,
+        "mode": mode,
     }
 
     if missing:
@@ -720,6 +1192,14 @@ async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_collection_preview(update, "today")
+
+
+async def create_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_collection_preview(update, "new")
+
+
 async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     user = update.effective_user
@@ -728,17 +1208,25 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer("Оновлено")
-    properties, hidden_count, missing = await get_verified_today_properties()
+    preview = PREVIEWS.get(user.id, {})
+    mode = preview.get("mode", "today")
+    properties, hidden_count, missing = await get_verified_properties(mode)
     if not properties:
-        await q.edit_message_text("Сьогодні немає об'єктів для підбірки.")
+        empty_text = (
+            "Нових невикористаних об'єктів немає."
+            if mode == "new"
+            else "Сьогодні немає об'єктів для підбірки."
+        )
+        await q.edit_message_text(empty_text, reply_markup=home_keyboard())
         return
 
-    text = build_collection(properties, hidden_count)
+    text = build_collection(properties, hidden_count, mode=mode)
     visible_properties = properties_rendered_in(text, properties)
     PREVIEWS[user.id] = {
         "text": text,
         "properties": visible_properties,
         "hidden_count": hidden_count,
+        "mode": mode,
     }
 
     if missing:
@@ -795,8 +1283,16 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         edited_html,
         preview.get("properties", []),
     )
+    edited_html = restore_standard_collection_formatting(
+        edited_html,
+        preview.get("properties", []),
+    )
     edited_html = ensure_collection_footer(edited_html)
     preview["text"] = edited_html
+    preview["properties"] = properties_rendered_in(
+        edited_html,
+        preview.get("properties", []),
+    )
 
     await message.reply_text(
         edited_html,
@@ -850,26 +1346,49 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
     await q.answer("Публікую…")
     text = preview["text"]
     sent_to = []
+    sent_messages = []
     errors = []
 
     for channel in destinations:
         try:
-            await context.bot.send_message(
+            sent_message = await context.bot.send_message(
                 chat_id=channel,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
             sent_to.append(channel)
+            sent_messages.append({
+                "destination": channel,
+                "chat_id": sent_message.chat.id,
+                "message_id": sent_message.message_id,
+            })
         except Exception as exc:
             log.exception("Failed to publish to %s", channel)
             errors.append(f"{channel}: {exc}")
+
+    publication_id = None
+    if sent_messages:
+        try:
+            publication_id = record_publication(
+                user.id,
+                preview.get("mode", "today"),
+                text,
+                preview.get("properties", []),
+                sent_messages,
+            )
+        except Exception as exc:
+            log.exception("Published collection could not be recorded")
+            errors.append(f"Не вдалося зберегти кнопку скасування: {exc}")
 
     result = "✅ Опубліковано:\n" + "\n".join(sent_to) if sent_to else "❌ Не вдалося опублікувати."
     if errors:
         result += "\n\nПомилки:\n" + "\n".join(errors)
 
-    await q.message.reply_text(result, reply_markup=home_keyboard())
+    await q.message.reply_text(
+        result,
+        reply_markup=(published_keyboard(publication_id) if publication_id else home_keyboard()),
+    )
 
 
 async def destination_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -916,6 +1435,71 @@ async def cancel_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text("❌ Підбірку скасовано.", reply_markup=home_keyboard())
 
 
+async def back_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await deny(update)
+        return
+    await q.answer()
+    await q.message.reply_text("Оберіть тип підбірки:", reply_markup=home_keyboard())
+
+
+def message_is_already_deleted_error(exc: Exception):
+    message = str(exc).lower()
+    return "message to delete not found" in message or "message not found" in message
+
+
+async def undo_publication(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await deny(update)
+        return
+
+    publication_id = int(q.data.split(":", 1)[1])
+    messages = get_active_publication_messages(publication_id)
+    if not messages:
+        await q.answer("Публікацію вже видалено або вона не знайдена.", show_alert=True)
+        return
+
+    await q.answer("Видаляю…")
+    errors = []
+    for message in messages:
+        try:
+            await context.bot.delete_message(
+                chat_id=message["chat_id"],
+                message_id=message["message_id"],
+            )
+            mark_publication_message_deleted(message["id"])
+        except Exception as exc:
+            if message_is_already_deleted_error(exc):
+                mark_publication_message_deleted(message["id"])
+                continue
+            log.exception(
+                "Failed to undo publication %s in %s",
+                publication_id,
+                message["destination"],
+            )
+            errors.append(f"{message['destination']}: {exc}")
+
+    fully_deleted = finish_publication_undo(publication_id)
+    if fully_deleted:
+        await q.edit_message_text(
+            "↩️ Публікацію скасовано та видалено з усіх каналів.\n\n"
+            "Її об'єкти знову доступні для підбірки «Тільки нові об'єкти».",
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    await q.message.reply_text(
+        "⚠️ Частину публікації не вдалося видалити. Перевірте право бота "
+        "«Видалення повідомлень» і натисніть кнопку ще раз.\n\n"
+        + "\n".join(errors),
+        reply_markup=published_keyboard(publication_id),
+    )
+
+
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # MessageHandler with ChatType.CHANNEL reaches both normal and edited channel messages.
     if not (update.channel_post or update.edited_channel_post):
@@ -947,6 +1531,7 @@ def main():
 
     # Admin UI.
     app.add_handler(CallbackQueryHandler(create_today, pattern=r"^create_today$"))
+    app.add_handler(CallbackQueryHandler(create_new, pattern=r"^create_new$"))
     app.add_handler(CallbackQueryHandler(regenerate, pattern=r"^regenerate$"))
     app.add_handler(CallbackQueryHandler(edit_preview, pattern=r"^edit_preview$"))
     app.add_handler(CallbackQueryHandler(publish_menu, pattern=r"^publish_menu$"))
@@ -958,7 +1543,9 @@ def main():
         )
     )
     app.add_handler(CallbackQueryHandler(back_preview, pattern=r"^back_preview$"))
+    app.add_handler(CallbackQueryHandler(back_home, pattern=r"^back_home$"))
     app.add_handler(CallbackQueryHandler(cancel_preview, pattern=r"^cancel_preview$"))
+    app.add_handler(CallbackQueryHandler(undo_publication, pattern=r"^undo_publish:\d+$"))
 
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_edit)
