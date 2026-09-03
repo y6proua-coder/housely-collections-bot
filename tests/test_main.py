@@ -121,6 +121,51 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(parsed["property_type"], "Кімната")
         self.assertEqual(parsed["audience"], "пари")
 
+    def test_one_bedroom_apartment_is_not_a_room(self):
+        parsed = main.parse_property(
+            "🏡 Здається 1-кімнатна квартира в Dublin 14\n"
+            "📍 Локація: Dublin 14\n"
+            "💶 Вартість: 1400€/міс\n"
+            "👤 ЛИШЕ для 1 особи з роботою !\n"
+            "📝 Для запису на перегляд пишіть @team_housely\n"
+            "Ref 2021"
+        )
+        self.assertEqual(parsed["property_type"], "Квартира")
+        self.assertEqual(parsed["audience"], "1 особи з роботою")
+        self.assertEqual(parsed["location"], "Dublin 14")
+
+    def test_contact_cta_is_never_used_as_audience(self):
+        parsed = main.parse_property(
+            "Здається квартира в Dublin 14\n"
+            "Вартість: €1,400\n"
+            "Для запису на перегляд пишіть @team_housely\n"
+            "Ref 2022"
+        )
+        self.assertIsNone(parsed["audience"])
+
+    def test_family_line_is_used_as_audience(self):
+        parsed = main.parse_property(
+            "🏡 Здається 1-кімнатна квартира в Dublin 18\n"
+            "📍 Локація: Dublin 18\n"
+            "💶 Вартість: €2200/міс\n"
+            "👤 Для сім’ї з роботою/студенти\n"
+            "Ref 2023"
+        )
+        self.assertEqual(parsed["property_type"], "Квартира")
+        self.assertEqual(parsed["audience"], "сім’ї з роботою/студенти")
+
+    def test_plural_rooms_beat_later_house_context(self):
+        parsed = main.parse_property(
+            "🏡 Здається 9 кімнат в Dublin 24 для одного\n"
+            "📍 Локація: Dublin 24\n"
+            "💶 Вартість: 850€/міс з людини\n"
+            "🏠 В будинку без власників, всього 12 кімнат та 5 санвузлів\n"
+            "📝 Для запису на перегляд пишіть @team_housely\n"
+            "Ref 2020"
+        )
+        self.assertEqual(parsed["property_type"], "Кімната")
+        self.assertEqual(parsed["audience"], "одного")
+
     def test_apartment_is_not_misread_from_bedroom(self):
         self.assertEqual(
             main.extract_property_type("2-bedroom apartment in Dublin 2"),
@@ -341,6 +386,30 @@ class TestDatabaseCleanup(unittest.TestCase):
         self.insert_item(second)
         rows, _ = main.get_today_properties(apply_limit=False)
         self.assertEqual(len(rows), 1)
+
+    def test_manual_channel_post_with_new_ref_is_saved_directly(self):
+        now = datetime.now(timezone.utc)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(username="irelandrent", id=-100777),
+            text=(
+                "Здається кімната в Dublin 24\n"
+                "Для однієї особи з роботою\n"
+                "Вартість: €850\n"
+                "Ref 2999"
+            ),
+            caption=None,
+            message_id=2020,
+            date=now,
+        )
+        update = SimpleNamespace(channel_post=message, edited_channel_post=None)
+
+        self.assertTrue(main.save_channel_post(update))
+        rows, _ = main.get_today_properties(apply_limit=False)
+
+        self.assertEqual([row["ref"] for row in rows], ["0002999"])
+        self.assertEqual(rows[0]["property_type"], "Кімната")
+        self.assertEqual(rows[0]["audience"], "однієї особи з роботою")
+        self.assertEqual(rows[0]["post_url"], "https://t.me/irelandrent/2020")
 
     def test_published_items_are_excluded_from_new_collection(self):
         item = property_item(1)

@@ -4,7 +4,9 @@ Bot for compact daily housing collections.
 
 ## What it does
 
-- Watches new property posts in `@dublin_rent` and `@irelandrent`.
+- Watches new property posts directly in `@dublin_rent` and `@irelandrent`.
+- Collects posts published manually or by any bot. The Publish Bot database is
+  not used: a new post with a new `Ref` in a source channel is enough.
 - Reads only posts that contain a `Ref`.
 - Extracts Ref, location, price, object type, audience and original post URL.
 - Provides two collection modes:
@@ -32,7 +34,11 @@ Bot for compact daily housing collections.
 
 ## Important limitation
 
-Telegram Bot API does not backfill old channel history. The bot will only collect posts it receives after it is running in Railway and present in the source channels.
+Telegram Bot API does not provide arbitrary channel-history backfill. The bot
+collects posts delivered to it while it is an administrator in the source
+channels; polling also keeps pending updates enabled. If an older post was
+missed entirely, repost or edit it after the bot is running so Telegram sends a
+new update.
 
 For the first test:
 1. Deploy the bot.
@@ -66,9 +72,10 @@ The source channels must stay public for live deletion checks. A temporary
 Telegram/network error is fail-safe: the item remains in the collection. Only a
 definitive "post not found" response removes it from the local database.
 
-The bot must be an administrator with permission to post in every destination
-channel. To use the undo button, it also needs permission to delete messages in
-those channels.
+The bot must be an administrator in both source channels so it receives manual
+and automated channel posts. It also needs permission to post in every
+destination channel. To use the undo button, it needs permission to delete
+messages in those channels.
 
 Multiple admins example:
 

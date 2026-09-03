@@ -68,6 +68,9 @@ log = logging.getLogger("housely-collections")
 PREVIEWS = {}
 EDIT_WAITING = set()
 
+# Increment when saved channel posts must be reparsed after a parser fix.
+PARSER_SCHEMA_VERSION = "2"
+
 
 # =========================
 # DATABASE
@@ -172,20 +175,40 @@ def init_db():
             """
         )
 
-        # Existing Railway volumes predate the property_type column. Backfill
-        # once so their saved posts immediately use the new compact titles.
-        rows = conn.execute(
-            """
-            SELECT id, raw_text, description
-            FROM property_posts
-            WHERE property_type IS NULL OR property_type = ''
-            """
-        ).fetchall()
-        for row in rows:
-            source = row["raw_text"] or row["description"] or ""
+        # Reparse saved channel posts once after parser changes. This repairs
+        # already stored rows too (for example, a room post previously
+        # classified as a house because the body mentioned "будинок").
+        parser_version = conn.execute(
+            "SELECT value FROM bot_settings WHERE key = 'parser_schema_version'"
+        ).fetchone()
+        if not parser_version or parser_version["value"] != PARSER_SCHEMA_VERSION:
+            rows = conn.execute(
+                """
+                SELECT id, raw_text, description
+                FROM property_posts
+                """
+            ).fetchall()
+            for row in rows:
+                source = row["raw_text"] or row["description"] or ""
+                conn.execute(
+                    """
+                    UPDATE property_posts
+                    SET property_type = ?, audience = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        extract_property_type(source),
+                        extract_audience(source),
+                        row["id"],
+                    ),
+                )
             conn.execute(
-                "UPDATE property_posts SET property_type = ? WHERE id = ?",
-                (extract_property_type(source), row["id"]),
+                """
+                INSERT INTO bot_settings (key, value)
+                VALUES ('parser_schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (PARSER_SCHEMA_VERSION,),
             )
 
 
@@ -281,20 +304,87 @@ def extract_audience(text: str):
     if labeled:
         return labeled[:120]
 
-    for raw in text.splitlines():
-        line = clean_line(raw)
-        m = re.match(r"^(?:Для|For)\s+(.+)$", line, re.IGNORECASE)
+    lines = [clean_line(raw) for raw in text.splitlines() if clean_line(raw)]
+
+    # Audience rows in real posts are often not labeled. Examples:
+    # "ЛИШЕ для 1 особи з роботою" or "Для сім'ї з роботою/студенти".
+    # Contact CTAs also begin with "Для", so they must never be accepted as
+    # the audience ("Для запису на перегляд пишіть ...").
+    contact_markers = (
+        "для запису", "для записи", "для перегляду", "для просмотра",
+        "для деталей", "для подробностей", "для уточнення", "для связи",
+        "для зв'язку", "для контакту", "пишіть", "пишите", "напишіть",
+        "напишите", "@team_housely",
+    )
+    audience_line_re = re.compile(
+        r"^(?:(?:лише|тільки|только|only)\s+)?"
+        r"(?:підходить\s+|підійде\s+|подходит\s+)?"
+        r"(?:для|for)\s+(.+)$",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        low = line.lower()
+        if any(marker in low for marker in contact_markers):
+            continue
+        m = audience_line_re.match(line)
         if m:
-            return clean_line(m.group(1))[:120]
+            return clean_line(m.group(1)).strip(" .,!–—-")[:120]
+
+    # Last fallback: a short audience phrase can be part of the headline,
+    # e.g. "Здається 9 кімнат ... для одного".
+    audience_hint_re = re.compile(
+        r"\b(?:для|for)\s+"
+        r"((?:1|одн(?:ого|ієї|у)|пари|пар[ыи]|сім['’]?ї|семьи|"
+        r"родини|семьи|студент(?:а|ів|ов|и)?|дівчин(?:и|у)|хлопц(?:я|ів))\b.*)$",
+        re.IGNORECASE,
+    )
+    for line in lines[:3]:
+        low = line.lower()
+        if any(marker in low for marker in contact_markers):
+            continue
+        m = audience_hint_re.search(line)
+        if m:
+            return clean_line(m.group(1)).strip(" .,!–—-")[:120]
     return None
 
 
 PROPERTY_TYPE_PATTERNS = (
-    ("Ліжко-місце", (r"ліжко[\s-]*місце", r"койко[\s-]*место", r"\bbed\s*space\b")),
-    ("Студія", (r"студі[яї]", r"студи[яи]", r"\bstudio\b")),
-    ("Квартира", (r"квартир[аиуиі]", r"апартамент[иыа]?", r"\bapartment\b", r"\bflat\b")),
-    ("Будинок", (r"будинок", r"будинк[уа]", r"\bдом\b", r"\bhouse\b")),
-    ("Кімната", (r"кімнат[аиуиі]", r"комнат[аыуе]", r"\broom\b")),
+    (
+        "Ліжко-місце",
+        (
+            r"\bліжко[\s-]*місц(?:е|я|ю|і|ь)?\b",
+            r"\bкойко[\s-]*мест(?:о|а|у|е)?\b",
+            r"\bbed\s*spaces?\b",
+        ),
+    ),
+    ("Студія", (r"\bстуді(?:я|ї|ю|єю|ях)\b", r"\bстуди(?:я|и|ю|ей)\b", r"\bstudios?\b")),
+    (
+        "Квартира",
+        (
+            r"\bквартир(?:а|и|у|і|ою|ах|ами)?\b",
+            r"\bапартамент(?:и|ів|ы|ов|а|ах)?\b",
+            r"\bapartments?\b",
+            r"\bflats?\b",
+        ),
+    ),
+    (
+        "Будинок",
+        (
+            r"\bбудин(?:ок|ку|ком|ки|ків|ках|ками)\b",
+            r"\bдом(?:а|у|ом|е|ы|ов|ах|ами)?\b",
+            r"\bhouses?\b",
+        ),
+    ),
+    (
+        "Кімната",
+        (
+            # Full-word forms deliberately avoid the adjective in
+            # "1-кімнатна квартира" / "1-комнатная квартира".
+            r"\bкімнат(?:а|и|у|і|ою|ам|ами|ах)?\b",
+            r"\bкомнат(?:а|ы|у|е|ой|ам|ами|ах)?\b",
+            r"\brooms?\b",
+        ),
+    ),
 )
 
 PROPERTY_TYPE_ORDER = {
