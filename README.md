@@ -11,17 +11,22 @@ Bot for compact daily housing collections.
   channels. This restores recent Refs missed during a Railway restart or
   redeploy.
 - Reads only posts that contain a `Ref`.
+- Treats every Telegram post as a separate object by its channel link/message
+  ID. Repeated Refs do not make a newer post disappear.
 - Extracts Ref, location, price, object type, audience and original post URL.
 - Provides two collection modes:
   - `📅 Підбірка за сьогодні` — all current objects published today.
-  - `🆕 Тільки нові об'єкти` — only objects that have not appeared in a
-    successfully published collection yet.
-- Marks an object as used only after at least one channel publication succeeds.
-  Creating, editing, regenerating or cancelling a Preview does not mark it.
+  - `🆕 Тільки нові об'єкти` — every object post published after the most recent
+    successfully published collection.
+- Moves the New-mode time boundary only after at least one channel publication
+  succeeds. Creating, editing, regenerating or cancelling a Preview does not
+  move it.
 - Groups the collection by object type (rooms first, then bedspaces,
   apartments, studios, houses), and by location inside every type.
 - Uses compact item titles: object type + audience + price + `Детальніше`.
   Marketing phrases from the original title are not copied into a collection.
+  If the type cannot be recognized, the post is still included without a type
+  heading or an invented type name.
 - Preview buttons: Publish / Edit / Regenerate / Cancel.
 - Can publish to the main channel, either object channel, or both object channels.
 - Before every Preview/Regenerate, checks the public Telegram source links and
@@ -50,9 +55,9 @@ For the first test:
 3. Send `/start` to the bot in private chat.
 4. Press `📅 Підбірка за сьогодні` or `🆕 Тільки нові об'єкти`.
 
-`Тільки нові об'єкти` is based only on successful publications. Deployment or
-restart time never marks an object as used. A successful `Підбірка за сьогодні`
-publication also marks its objects as used for the New mode.
+`Тільки нові об'єкти` is based only on the time of the last successful
+publication. Deployment or restart time never moves that boundary. A successful
+`Підбірка за сьогодні` publication also becomes the new boundary for New mode.
 
 ## Railway Variables
 

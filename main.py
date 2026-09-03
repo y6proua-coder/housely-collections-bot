@@ -74,7 +74,7 @@ PREVIEWS = {}
 EDIT_WAITING = set()
 
 # Increment when saved channel posts must be reparsed after a parser fix.
-PARSER_SCHEMA_VERSION = "2"
+PARSER_SCHEMA_VERSION = "3"
 
 
 # =========================
@@ -380,6 +380,7 @@ PROPERTY_TYPE_PATTERNS = (
             # "1-кімнатна квартира" / "1-комнатная квартира".
             r"\bкімнат(?:а|и|у|і|ою|ам|ами|ах)?\b",
             r"\bкомнат(?:а|ы|у|е|ой|ам|ами|ах)?\b",
+            r"\bкемнат(?:а|ы|у|е|ой|ам|ами|ах)?\b",
             r"\brooms?\b",
         ),
     ),
@@ -452,6 +453,8 @@ def item_property_type(item):
 def property_display_title(item):
     property_type = item_property_type(item)
     audience = normalize_audience(item.get("audience"))
+    if property_type == "Житло":
+        return f"Для {audience}" if audience else ""
     return f"{property_type} для {audience}" if audience else property_type
 
 
@@ -721,15 +724,17 @@ async def sync_recent_source_posts():
 
 
 def _deduplicate_and_sort(rows):
-    """Keep the newest post for each Ref and group the result by object type."""
-    latest_by_ref = {}
+    """Keep every distinct Telegram post, even when two posts share a Ref."""
+    latest_by_post = {}
     for row in rows:
         item = dict(row)
-        ref = item["ref"] or f"{item['channel_id']}:{item['message_id']}"
-        if ref not in latest_by_ref:
-            latest_by_ref[ref] = item
+        post_key = item.get("post_url") or (
+            f"{item.get('channel_username')}:{item.get('message_id')}"
+        )
+        if post_key not in latest_by_post:
+            latest_by_post[post_key] = item
 
-    result = list(latest_by_ref.values())
+    result = list(latest_by_post.values())
     result.sort(key=collection_sort_key)
     return result
 
@@ -758,28 +763,29 @@ def get_today_properties(apply_limit=True):
 
 
 def get_uncollected_properties(apply_limit=True):
-    """Return posts not present in any collection that is still published."""
+    """Return every post published after the last successful collection."""
     with db() as conn:
+        last_publication = conn.execute(
+            """
+            SELECT MAX(cp.created_at_utc) AS created_at_utc
+            FROM collection_publications AS cp
+            WHERE cp.deleted_at_utc IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM collection_publication_messages AS cpm
+                  WHERE cpm.publication_id = cp.id
+                    AND cpm.deleted_at_utc IS NULL
+              )
+            """
+        ).fetchone()["created_at_utc"]
         rows = conn.execute(
             """
-            SELECT pp.*
-            FROM property_posts AS pp
-            WHERE NOT EXISTS (
-                  SELECT 1
-                  FROM collection_publication_items AS cpi
-                  JOIN collection_publications AS cp
-                    ON cp.id = cpi.publication_id
-                  WHERE cpi.ref = pp.ref
-                    AND cp.deleted_at_utc IS NULL
-                    AND EXISTS (
-                        SELECT 1
-                        FROM collection_publication_messages AS cpm
-                        WHERE cpm.publication_id = cp.id
-                          AND cpm.deleted_at_utc IS NULL
-                    )
-              )
-            ORDER BY pp.created_at_utc DESC
-            """
+            SELECT *
+            FROM property_posts
+            WHERE ? IS NULL OR created_at_utc > ?
+            ORDER BY created_at_utc DESC
+            """,
+            (last_publication, last_publication),
         ).fetchall()
 
     return _with_limit(_deduplicate_and_sort(rows), apply_limit)
@@ -1046,11 +1052,11 @@ def build_collection(properties, hidden_count=0, mode="today"):
         by_type,
         key=lambda value: PROPERTY_TYPE_ORDER.get(value, 99),
     ):
-        section_icon, section_title = PROPERTY_TYPE_SECTIONS.get(
-            property_type,
-            PROPERTY_TYPE_SECTIONS["Житло"],
-        )
-        parts.append(f"{section_icon} <b>{html.escape(section_title)}</b>")
+        # Unknown types are still rendered, but without inventing a housing
+        # type or adding an "Інше житло" heading.
+        if property_type != "Житло":
+            section_icon, section_title = PROPERTY_TYPE_SECTIONS[property_type]
+            parts.append(f"{section_icon} <b>{html.escape(section_title)}</b>")
 
         by_location = {}
         for item in by_type[property_type]:
@@ -1064,8 +1070,9 @@ def build_collection(properties, hidden_count=0, mode="today"):
                 description = html.escape(property_display_title(item))
                 price = html.escape(item["price"])
                 url = html.escape(item["post_url"], quote=True)
+                description_part = f"{description} — " if description else ""
                 parts.append(
-                    f"• {icon} {description} — <b>{price}</b> → "
+                    f"• {icon} {description_part}<b>{price}</b> → "
                     f'<a href="{url}"><b>Детальніше</b></a>'
                 )
             parts.append("")
@@ -1099,10 +1106,9 @@ def normalize_match_text(value: str) -> str:
 
 
 def property_line_plain(item) -> str:
-    return (
-        f"{property_type_icon(item)} {property_display_title(item)} — "
-        f"{item['price']} → Детальніше"
-    )
+    title = property_display_title(item)
+    title_part = f"{title} — " if title else ""
+    return f"{property_type_icon(item)} {title_part}{item['price']} → Детальніше"
 
 
 def find_edited_line_property(line: str, properties, used_indexes):
@@ -1313,7 +1319,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Housely Collections Bot\n\n"
         "Бот збирає нові об'єкти з @dublin_rent та @irelandrent "
         "і формує компактні підбірки за сьогодні або тільки з об'єктів, "
-        "які ще не входили до опублікованої підбірки.",
+        "опублікованих після останньої успішної підбірки.",
         reply_markup=home_keyboard(),
     )
 
@@ -1338,9 +1344,10 @@ async def create_collection_preview(update: Update, mode: str):
     if not properties:
         if mode == "new":
             empty_text = (
-                "Об'єктів, які ще не входили до опублікованої підбірки, поки немає.\n\n"
-                "Об'єкт вважається використаним тільки після успішної публікації, "
-                "а не після створення Preview."
+                "Нових об'єктів після останньої успішно опублікованої "
+                "підбірки поки немає.\n\n"
+                "Preview, редагування, Regenerate або Cancel не змінюють "
+                "момент останньої публікації."
             )
         else:
             empty_text = (

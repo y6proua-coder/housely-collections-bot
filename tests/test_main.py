@@ -166,6 +166,19 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(parsed["property_type"], "Кімната")
         self.assertEqual(parsed["audience"], "одного")
 
+    def test_russian_nine_rooms_from_screenshot_is_a_room_post(self):
+        parsed = main.parse_property(
+            "🏡 Сдается 9 комнат в Dublin 24 для одного\n"
+            "📍 Локація: Dublin 24\n"
+            "💶 Вартість: 850€/міс з людини\n"
+            "⭐ Наразі доступно 9 single кімнат\n"
+            "🏠 В будинку без власників, всього 12 кімнат та 5 санвузлів\n"
+            "📝 Для запису на перегляд пишіть @team_housely\n"
+            "Ref 936"
+        )
+        self.assertEqual(parsed["property_type"], "Кімната")
+        self.assertEqual(parsed["location"], "Dublin 24")
+
     def test_apartment_is_not_misread_from_bedroom(self):
         self.assertEqual(
             main.extract_property_type("2-bedroom apartment in Dublin 2"),
@@ -295,6 +308,20 @@ class TestCollectionBuilder(unittest.TestCase):
         self.assertLess(text.index("<b>Кімнати</b>"), text.index("<b>Будинки</b>"))
         self.assertLess(text.index("Dublin 24"), text.index("Dublin 1"))
 
+    def test_unknown_type_is_included_without_invented_type_heading(self):
+        item = property_item(
+            1,
+            description="Нова пропозиція",
+            location="Dublin 24",
+            property_type="Житло",
+        )
+        text = main.build_collection([item], mode="new")
+
+        self.assertIn("📍 <b>Dublin 24</b>", text)
+        self.assertIn("• 🏠 <b>€901</b>", text)
+        self.assertIn(item["post_url"], text)
+        self.assertNotIn("Інше житло", text)
+
     def test_new_collection_has_distinct_title(self):
         text = main.build_collection([property_item(1)], mode="new")
         self.assertIn("Нові актуальні пропозиції", text)
@@ -379,13 +406,16 @@ class TestDatabaseCleanup(unittest.TestCase):
         remaining, _ = main.get_today_properties(apply_limit=False)
         self.assertEqual(len(remaining), 1)
 
-    def test_duplicate_ref_keeps_latest_post(self):
+    def test_duplicate_ref_does_not_hide_a_distinct_post(self):
         first, second = property_item(1), property_item(2)
         second["ref"] = first["ref"]
         self.insert_item(first)
         self.insert_item(second)
         rows, _ = main.get_today_properties(apply_limit=False)
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["post_url"] for row in rows}, {
+            first["post_url"], second["post_url"],
+        })
 
     def test_manual_channel_post_with_new_ref_is_saved_directly(self):
         now = datetime.now(timezone.utc)
@@ -463,6 +493,44 @@ class TestDatabaseCleanup(unittest.TestCase):
             {row["ref"] for row in remaining},
             {item["ref"] for item in new_items},
         )
+
+    def test_two_new_posts_with_same_ref_are_both_included(self):
+        baseline = property_item(1)
+        self.insert_item(baseline)
+        main.record_publication(
+            123,
+            "new",
+            "last collection",
+            [baseline],
+            [{"destination": "@main", "chat_id": -1009, "message_id": 55}],
+        )
+
+        first, second = property_item(2), property_item(3)
+        second["ref"] = first["ref"]
+        self.insert_item(first)
+        self.insert_item(second)
+
+        remaining, _ = main.get_uncollected_properties(apply_limit=False)
+        self.assertEqual(
+            {row["post_url"] for row in remaining},
+            {first["post_url"], second["post_url"]},
+        )
+
+    def test_post_before_last_publication_is_not_new_even_if_omitted(self):
+        omitted = property_item(1)
+        published = property_item(2)
+        self.insert_item(omitted)
+        self.insert_item(published)
+        main.record_publication(
+            123,
+            "new",
+            "last collection",
+            [published],
+            [{"destination": "@main", "chat_id": -1009, "message_id": 55}],
+        )
+
+        remaining, _ = main.get_uncollected_properties(apply_limit=False)
+        self.assertEqual(remaining, [])
 
     def test_undo_makes_items_new_again(self):
         item = property_item(1)
