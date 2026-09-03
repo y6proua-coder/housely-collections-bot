@@ -7,6 +7,9 @@ Bot for compact daily housing collections.
 - Watches new property posts directly in `@dublin_rent` and `@irelandrent`.
 - Collects posts published manually or by any bot. The Publish Bot database is
   not used: a new post with a new `Ref` in a source channel is enough.
+- Before every Preview, also reloads recent public posts from both source
+  channels. This restores recent Refs missed during a Railway restart or
+  redeploy.
 - Reads only posts that contain a `Ref`.
 - Extracts Ref, location, price, object type, audience and original post URL.
 - Provides two collection modes:
@@ -36,9 +39,10 @@ Bot for compact daily housing collections.
 
 Telegram Bot API does not provide arbitrary channel-history backfill. The bot
 collects posts delivered to it while it is an administrator in the source
-channels; polling also keeps pending updates enabled. If an older post was
-missed entirely, repost or edit it after the bot is running so Telegram sends a
-new update.
+channels; polling also keeps pending updates enabled. The public-channel sync
+recovers recent posts automatically. If a much older post is no longer present
+on the public preview page and was missed entirely, repost or edit it after the
+bot is running so Telegram sends a new update.
 
 For the first test:
 1. Deploy the bot.
@@ -46,9 +50,8 @@ For the first test:
 3. Send `/start` to the bot in private chat.
 4. Press `📅 Підбірка за сьогодні` or `🆕 Тільки нові об'єкти`.
 
-On the first deployment of this version, `Тільки нові об'єкти` starts tracking
-from the deployment time. This prevents old rows from an existing Railway
-database from suddenly appearing as new. A successful `Підбірка за сьогодні`
+`Тільки нові об'єкти` is based only on successful publications. Deployment or
+restart time never marks an object as used. A successful `Підбірка за сьогодні`
 publication also marks its objects as used for the New mode.
 
 ## Railway Variables
@@ -67,6 +70,8 @@ Add:
 - `VERIFY_SOURCE_POSTS=true`
 - `POST_CHECK_TIMEOUT=8`
 - `POST_CHECK_CONCURRENCY=8`
+- `SOURCE_SYNC_ENABLED=true`
+- `SOURCE_SYNC_TIMEOUT=6`
 
 The source channels must stay public for live deletion checks. A temporary
 Telegram/network error is fail-safe: the item remains in the collection. Only a

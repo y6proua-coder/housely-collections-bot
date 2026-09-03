@@ -411,6 +411,22 @@ class TestDatabaseCleanup(unittest.TestCase):
         self.assertEqual(rows[0]["audience"], "однієї особи з роботою")
         self.assertEqual(rows[0]["post_url"], "https://t.me/irelandrent/2020")
 
+    def test_legacy_deploy_timestamp_does_not_hide_unpublished_refs(self):
+        item = property_item(1)
+        self.insert_item(item)
+        with main.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_settings (key, value)
+                VALUES ('new_collections_tracking_started_at_utc', ?)
+                """,
+                ("2099-01-01T00:00:00+00:00",),
+            )
+
+        rows, _ = main.get_uncollected_properties(apply_limit=False)
+
+        self.assertEqual([row["ref"] for row in rows], [item["ref"]])
+
     def test_published_items_are_excluded_from_new_collection(self):
         item = property_item(1)
         self.insert_item(item)
@@ -425,6 +441,28 @@ class TestDatabaseCleanup(unittest.TestCase):
         self.assertIsInstance(publication_id, int)
         remaining, _ = main.get_uncollected_properties(apply_limit=False)
         self.assertEqual(remaining, [])
+
+    def test_five_refs_after_last_publication_are_all_new(self):
+        previously_published = property_item(1)
+        self.insert_item(previously_published)
+        rows, _ = main.get_uncollected_properties(apply_limit=False)
+        main.record_publication(
+            123,
+            "new",
+            "yesterday collection",
+            rows,
+            [{"destination": "@main", "chat_id": -1009, "message_id": 55}],
+        )
+
+        new_items = [property_item(index) for index in range(2, 7)]
+        for item in new_items:
+            self.insert_item(item)
+
+        remaining, _ = main.get_uncollected_properties(apply_limit=False)
+        self.assertEqual(
+            {row["ref"] for row in remaining},
+            {item["ref"] for item in new_items},
+        )
 
     def test_undo_makes_items_new_again(self):
         item = property_item(1)
@@ -505,6 +543,99 @@ class TestDatabaseMigration(unittest.TestCase):
             self.assertIsNotNone(publication_table)
         finally:
             main.DB_PATH = old_db_path
+            temp_dir.cleanup()
+
+
+class TestPublicChannelRecovery(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_db_path = main.DB_PATH
+        self.old_sync_enabled = main.SOURCE_SYNC_ENABLED
+        main.DB_PATH = Path(self.temp_dir.name) / "collections.db"
+        main.SOURCE_SYNC_ENABLED = True
+        main.init_db()
+
+    def tearDown(self):
+        main.DB_PATH = self.old_db_path
+        main.SOURCE_SYNC_ENABLED = self.old_sync_enabled
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def channel_page_html():
+        return """
+        <div class="tgme_widget_message" data-post="irelandrent/2020">
+          <div class="tgme_widget_message_text">
+            Здається кімната в Dublin 24<br>
+            Для однієї особи з роботою<br>
+            Вартість: €850<br>
+            Ref 0000937
+          </div>
+          <time datetime="2026-09-03T18:25:00+00:00"></time>
+        </div>
+        """
+
+    def test_public_channel_html_yields_ref_post(self):
+        posts = main.parse_public_channel_page(
+            "irelandrent",
+            self.channel_page_html(),
+        )
+
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["message_id"], 2020)
+        self.assertIn("Ref 0000937", posts[0]["text"])
+
+    async def test_source_sync_recovers_post_after_empty_redeploy_database(self):
+        response = SimpleNamespace(
+            text=self.channel_page_html(),
+            raise_for_status=lambda: None,
+        )
+        fake_client = AsyncMock()
+        fake_client.get.return_value = response
+        fake_client.__aenter__.return_value = fake_client
+        fake_client.__aexit__.return_value = None
+
+        with patch.object(main.httpx, "AsyncClient", return_value=fake_client):
+            saved = await main.sync_recent_source_posts()
+
+        rows, _ = main.get_uncollected_properties(apply_limit=False)
+        self.assertEqual(saved, 1)
+        self.assertEqual([row["ref"] for row in rows], ["0000937"])
+
+
+class TestPreviewPublicationSeparation(unittest.IsolatedAsyncioTestCase):
+    async def test_preview_does_not_create_publication_record(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        old_db_path = main.DB_PATH
+        old_admin_ids = main.ADMIN_IDS
+        main.DB_PATH = Path(temp_dir.name) / "collections.db"
+        main.ADMIN_IDS = {123}
+        main.init_db()
+        try:
+            query = SimpleNamespace(
+                answer=AsyncMock(),
+                message=SimpleNamespace(reply_text=AsyncMock()),
+            )
+            update = SimpleNamespace(
+                callback_query=query,
+                effective_user=SimpleNamespace(id=123),
+            )
+            with patch.object(
+                main,
+                "get_verified_properties",
+                new=AsyncMock(return_value=([property_item(1)], 0, [])),
+            ):
+                await main.create_collection_preview(update, "new")
+
+            with main.db() as conn:
+                publication_count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM collection_publications"
+                ).fetchone()["count"]
+            self.assertEqual(publication_count, 0)
+            self.assertIn(123, main.PREVIEWS)
+        finally:
+            main.PREVIEWS.pop(123, None)
+            main.DB_PATH = old_db_path
+            main.ADMIN_IDS = old_admin_ids
             temp_dir.cleanup()
 
 

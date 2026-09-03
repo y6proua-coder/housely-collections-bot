@@ -10,6 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -53,6 +54,10 @@ VERIFY_SOURCE_POSTS = os.environ.get("VERIFY_SOURCE_POSTS", "true").strip().lowe
 }
 POST_CHECK_TIMEOUT = float(os.environ.get("POST_CHECK_TIMEOUT", "8"))
 POST_CHECK_CONCURRENCY = max(1, int(os.environ.get("POST_CHECK_CONCURRENCY", "8")))
+SOURCE_SYNC_ENABLED = os.environ.get("SOURCE_SYNC_ENABLED", "true").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+SOURCE_SYNC_TIMEOUT = float(os.environ.get("SOURCE_SYNC_TIMEOUT", "6"))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -125,13 +130,6 @@ def init_db():
                 value TEXT NOT NULL
             )
             """
-        )
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO bot_settings (key, value)
-            VALUES ('new_collections_tracking_started_at_utc', ?)
-            """,
-            (datetime.now(timezone.utc).isoformat(),),
         )
         conn.execute(
             """
@@ -547,17 +545,17 @@ def parse_property(text: str):
 # STORAGE
 # =========================
 
-def save_channel_post(update: Update):
-    msg = update.channel_post or update.edited_channel_post
-    if not msg or not msg.chat:
-        return False
-
-    username = (msg.chat.username or "").lower()
-    if username not in SOURCE_CHANNELS:
-        return False
-
-    text = (msg.text or msg.caption or "").strip()
-    if not text:
+def upsert_property_post(
+    username: str,
+    channel_id: int | None,
+    message_id: int,
+    text: str,
+    message_date: datetime,
+):
+    """Save a Ref from the channel itself, regardless of who published it."""
+    username = (username or "").lstrip("@").lower()
+    text = (text or "").strip()
+    if username not in SOURCE_CHANNELS or not text:
         return False
 
     parsed = parse_property(text)
@@ -565,52 +563,161 @@ def save_channel_post(update: Update):
         # Ignore collections and any other posts without Ref.
         return False
 
-    post_url = f"https://t.me/{username}/{msg.message_id}"
+    if message_date.tzinfo is None:
+        message_date = message_date.replace(tzinfo=timezone.utc)
+    message_date_utc = message_date.astimezone(timezone.utc)
+    post_url = f"https://t.me/{username}/{message_id}"
     now_utc = datetime.now(timezone.utc).isoformat()
-    local_date = msg.date.astimezone(TZ).date().isoformat()
+    local_date = message_date_utc.astimezone(TZ).date().isoformat()
 
     with db() as conn:
-        conn.execute(
+        existing = conn.execute(
             """
-            INSERT INTO property_posts (
-                channel_username, channel_id, message_id,
-                ref, location, price, description, property_type, audience,
-                post_url, raw_text, local_date,
-                created_at_utc, updated_at_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(channel_id, message_id) DO UPDATE SET
-                ref=excluded.ref,
-                location=excluded.location,
-                price=excluded.price,
-                description=excluded.description,
-                property_type=excluded.property_type,
-                audience=excluded.audience,
-                post_url=excluded.post_url,
-                raw_text=excluded.raw_text,
-                local_date=excluded.local_date,
-                updated_at_utc=excluded.updated_at_utc
+            SELECT id
+            FROM property_posts
+            WHERE channel_username = ? AND message_id = ?
+            ORDER BY id DESC
+            LIMIT 1
             """,
-            (
-                username,
-                msg.chat.id,
-                msg.message_id,
-                parsed["ref"],
-                parsed["location"],
-                parsed["price"],
-                parsed["description"],
-                parsed["property_type"],
-                parsed["audience"],
-                post_url,
-                text,
-                local_date,
-                msg.date.astimezone(timezone.utc).isoformat(),
-                now_utc,
-            ),
+            (username, message_id),
+        ).fetchone()
+        values = (
+            channel_id,
+            parsed["ref"],
+            parsed["location"],
+            parsed["price"],
+            parsed["description"],
+            parsed["property_type"],
+            parsed["audience"],
+            post_url,
+            text,
+            local_date,
+            message_date_utc.isoformat(),
+            now_utc,
+        )
+        if existing:
+            conn.execute(
+                """
+                UPDATE property_posts
+                SET channel_id = COALESCE(?, channel_id),
+                    ref = ?, location = ?, price = ?, description = ?,
+                    property_type = ?, audience = ?, post_url = ?, raw_text = ?,
+                    local_date = ?, created_at_utc = ?, updated_at_utc = ?
+                WHERE id = ?
+                """,
+                values + (existing["id"],),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO property_posts (
+                    channel_username, channel_id, message_id,
+                    ref, location, price, description, property_type, audience,
+                    post_url, raw_text, local_date,
+                    created_at_utc, updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (username, channel_id, message_id) + values[1:],
+            )
+
+    log.info("Saved Ref %s from @%s/%s", parsed["ref"], username, message_id)
+    return True
+
+
+def save_channel_post(update: Update):
+    msg = update.channel_post or update.edited_channel_post
+    if not msg or not msg.chat:
+        return False
+
+    return upsert_property_post(
+        username=msg.chat.username or "",
+        channel_id=msg.chat.id,
+        message_id=msg.message_id,
+        text=msg.text or msg.caption or "",
+        message_date=msg.date,
+    )
+
+
+def parse_public_channel_page(username: str, page_html: str):
+    """Read recent public Telegram posts so a redeploy cannot hide their Refs."""
+    username = username.lstrip("@").lower()
+    soup = BeautifulSoup(page_html or "", "html.parser")
+    result = []
+
+    for post in soup.select("[data-post]"):
+        data_post = (post.get("data-post") or "").strip()
+        match = re.fullmatch(r"([^/]+)/(\d+)", data_post)
+        if not match or match.group(1).lower() != username:
+            continue
+
+        text_node = post.select_one(".tgme_widget_message_text")
+        time_node = post.select_one("time[datetime]")
+        if text_node is None or time_node is None:
+            continue
+
+        for br in text_node.find_all("br"):
+            br.replace_with("\n")
+        text = text_node.get_text("", strip=False).strip()
+        if not extract_ref(text):
+            continue
+
+        try:
+            message_date = datetime.fromisoformat(time_node["datetime"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        result.append({
+            "username": username,
+            "message_id": int(match.group(2)),
+            "text": text,
+            "message_date": message_date,
+        })
+
+    return result
+
+
+async def sync_recent_source_posts():
+    """Best-effort recovery of recent source posts missed during a restart."""
+    if not SOURCE_SYNC_ENABLED:
+        return 0
+
+    timeout = httpx.Timeout(SOURCE_SYNC_TIMEOUT)
+    headers = {"User-Agent": "HouselyCollectionsBot/1.2"}
+
+    async def fetch_channel(client, username):
+        url = f"https://t.me/s/{username}"
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning("Could not sync recent posts from @%s: %s", username, exc)
+            return 0
+
+        saved = 0
+        for post in parse_public_channel_page(username, response.text):
+            if upsert_property_post(
+                username=post["username"],
+                channel_id=None,
+                message_id=post["message_id"],
+                text=post["text"],
+                message_date=post["message_date"],
+            ):
+                saved += 1
+        return saved
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        counts = await asyncio.gather(
+            *(fetch_channel(client, username) for username in sorted(SOURCE_CHANNELS))
         )
 
-    log.info("Saved Ref %s from @%s/%s", parsed["ref"], username, msg.message_id)
-    return True
+    saved_count = sum(counts)
+    log.info("Source-channel sync completed: %s recent Ref post(s)", saved_count)
+    return saved_count
 
 
 def _deduplicate_and_sort(rows):
@@ -650,28 +757,14 @@ def get_today_properties(apply_limit=True):
     return _with_limit(_deduplicate_and_sort(rows), apply_limit)
 
 
-def get_setting(key: str):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT value FROM bot_settings WHERE key = ?",
-            (key,),
-        ).fetchone()
-    return row["value"] if row else None
-
-
 def get_uncollected_properties(apply_limit=True):
     """Return posts not present in any collection that is still published."""
-    tracking_started_at = get_setting("new_collections_tracking_started_at_utc")
-    if not tracking_started_at:
-        tracking_started_at = datetime.now(timezone.utc).isoformat()
-
     with db() as conn:
         rows = conn.execute(
             """
             SELECT pp.*
             FROM property_posts AS pp
-            WHERE pp.created_at_utc >= ?
-              AND NOT EXISTS (
+            WHERE NOT EXISTS (
                   SELECT 1
                   FROM collection_publication_items AS cpi
                   JOIN collection_publications AS cp
@@ -686,8 +779,7 @@ def get_uncollected_properties(apply_limit=True):
                     )
               )
             ORDER BY pp.created_at_utc DESC
-            """,
-            (tracking_started_at,),
+            """
         ).fetchall()
 
     return _with_limit(_deduplicate_and_sort(rows), apply_limit)
@@ -887,6 +979,9 @@ async def get_verified_uncollected_properties():
 
 
 async def get_verified_properties(mode: str):
+    # Re-read recent public channel posts first. This makes the database
+    # resilient to Railway restarts and catches manual posts by their Ref.
+    await sync_recent_source_posts()
     if mode == "new":
         return await get_verified_uncollected_properties()
     return await get_verified_today_properties()
@@ -1243,7 +1338,7 @@ async def create_collection_preview(update: Update, mode: str):
     if not properties:
         if mode == "new":
             empty_text = (
-                "Нових об'єктів після останньої опублікованої підбірки поки немає.\n\n"
+                "Об'єктів, які ще не входили до опублікованої підбірки, поки немає.\n\n"
                 "Об'єкт вважається використаним тільки після успішної публікації, "
                 "а не після створення Preview."
             )
