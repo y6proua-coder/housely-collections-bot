@@ -1,34 +1,57 @@
 # Housely Collections Bot
 
-Bot for compact housing collections built directly from the public Telegram source channels.
+## v0.7.2 — channel reliability fix
 
-## What changed in this version
+This version focuses on the exact failure seen after v0.7.1: the bot could show **“Сьогодні ... немає об'єктів”** even when the source channels contained listings.
 
-The source of truth for `📅 Підбірка за сьогодні` and `🆕 Тільки нові об'єкти` is now Telegram itself, not the `property_posts` SQLite table.
+### Main source logic
 
-- Before every Preview/Regenerate, the bot opens the public history of `@dublin_rent` and `@irelandrent`.
-- It paginates backwards far enough to cover the requested period, instead of reading only one recent page.
-- `Підбірка за сьогодні` takes posts whose Telegram publication date is today in `Europe/Dublin`.
-- `Тільки нові об'єкти` takes posts published after the last successfully published collection. If there has never been a successful collection, it starts from today's midnight.
-- Duplicate objects are removed before rendering. If posts have a real `Ref`, one `Ref` appears only once and the newest channel post is kept, even if it exists in both channels or was reposted.
-- Manual property posts without `Ref` can also be included. They receive an internal post identity only for publication tracking; the identity is never shown to users.
-- Generated collection posts are ignored so the bot does not parse its own collections back as housing objects.
-- If one of the source channels cannot be read, the bot does **not** silently fall back to stale database data. It stops that Preview and asks you to retry, preventing an incomplete collection.
+`📅 Підбірка за сьогодні` and `🆕 Тільки нові об'єкти` use the Telegram source channels:
 
-The old `property_posts` table and channel update handler remain in the project as a legacy cache, but they are no longer used to build Today/New collections. SQLite is still required for publication history, undo, and the "last successful collection" boundary.
+- `@dublin_rent`
+- `@irelandrent`
 
-## Collection format
+The public Telegram channel history is the primary source. The SQLite table is only a fallback mirror of real Telegram channel posts and publication/Undo history.
 
-The bot extracts location, price, object type, audience and original Telegram post URL, then groups objects by type and location. It keeps `Детальніше` links clickable and restores standard formatting after manual edits.
+### Reliability changes in v0.7.2
 
-Modes:
+- Telegram public history is retried up to 3 times when it returns an empty/anti-bot page or a temporary HTTP error.
+- An unreadable Telegram page is no longer treated as proof that there are zero objects. If both the direct source and the channel mirror are unavailable, the bot shows a source error instead of a false empty collection.
+- At startup the bot warms the fallback mirror from the last 72 hours of public channel history.
+- Normal `channel_post` and `edited_channel_post` updates keep the mirror fresh after startup.
+- Manual property posts without `Ref` are included when they have a recognizable property type, location and price.
+- Posts with a real Housely `Ref` are accepted even if a future/new property wording is not yet recognized by the type parser.
+- Repeated real `Ref` values are de-duplicated and only the newest Telegram post is kept.
+- Manual posts without `Ref` are de-duplicated by normalized post content.
+- Standard Housely footer text (`Переглядай актуальні пропозиції...`) no longer causes a normal listing to be rejected.
+- Generated collection posts are ignored and cannot be parsed back as listings.
+- Posts edited to `Не доступно`, `Недоступно`, `Неактуально`, `Здано/Сдано`, etc. are removed from the fallback mirror instead of remaining as stale listings.
+- `📍 Lucan`, `📍 Malahide, Co. Dublin`, etc. are recognized even when the location line has no `Локація:` label.
+- `Bed-space` / `bed space` / `ліжко-місце` variants are recognized.
+- Telegram caption markup is supported in addition to the usual message-text markup.
+- A partial collection is not produced if one source channel is unreadable and no safe fallback exists for that channel.
 
-- `📅 Підбірка за сьогодні` — live objects published today in the two source channels.
-- `🆕 Тільки нові об'єкти` — live objects published after the last successful collection.
+## Diagnostic command
 
-Preview controls remain: Publish / Edit / Regenerate / Cancel. Publishing can go to the main channel, either object channel, or both object channels. The undo button deletes all copies created by that publication and restores the previous New-mode boundary behavior.
+Admin-only command:
 
-## Railway Variables
+`/source_status`
+
+It reports, for each source channel:
+
+- how many listings can be read directly from Telegram today;
+- how many are available in the fallback channel-post mirror;
+- whether Telegram reports the bot as available in that source channel.
+
+If the result is `direct: ERROR` and `cache: 0`, the bot deliberately refuses to pretend that the channel is empty.
+
+## Important for stable fallback
+
+For the fallback mirror to receive future `channel_post` updates reliably, add the bot to both source channels (`@dublin_rent` and `@irelandrent`). In practice a Telegram bot is normally added to a channel as an administrator. It does not need to publish there just for the mirror logic, but it must be present so Telegram can deliver channel post updates.
+
+The direct public-history reader still works independently when Telegram allows the Railway server to read the public `/s/` pages.
+
+## Railway variables
 
 Required:
 
@@ -42,39 +65,54 @@ Required:
 - `MAX_ITEMS=25`
 - `DATA_DIR=/app/data`
 
-Live channel reading:
+Recommended source settings (defaults already match these values):
 
-- `LIVE_SOURCE_MAX_PAGES=20` — maximum public-history pages read per source channel for one collection.
-- `LIVE_SOURCE_TIMEOUT=8` — timeout in seconds for each Telegram public-page request.
+- `LIVE_SOURCE_MAX_PAGES=20`
+- `LIVE_SOURCE_TIMEOUT=8`
+- `LIVE_SOURCE_RETRIES=3`
+- `LIVE_SOURCE_RETRY_DELAY=0.8`
+- `SOURCE_SYNC_ENABLED=true`
+- `SOURCE_SYNC_LOOKBACK_HOURS=72`
 
-Legacy cache/check settings can remain unchanged; they are not the source for Today/New collections:
+Legacy source-post verification settings can remain:
 
 - `VERIFY_SOURCE_POSTS=true`
 - `POST_CHECK_TIMEOUT=8`
 - `POST_CHECK_CONCURRENCY=8`
-- `SOURCE_SYNC_ENABLED=true`
 - `SOURCE_SYNC_TIMEOUT=6`
-
-The source channels must be public because the collection builder reads `https://t.me/s/<channel>` history directly. The bot should still be an administrator in destination channels so it can publish and, if required, delete messages with Undo.
-
-Multiple admins example:
-
-`ADMIN_IDS=1231023850,987654321`
 
 ## Persistent database
 
-SQLite is stored at `/app/data/collections.db`. Keep the Railway Volume mounted at `/app/data`. The database is now used mainly for successful-publication history and Undo; it is no longer the primary source of property objects for collection creation.
+Keep the Railway Volume mounted at:
 
-## Test after deployment
+`/app/data`
 
-1. Deploy this version.
-2. Ensure `@dublin_rent` and `@irelandrent` are public.
-3. Publish or manually add several property posts, including a repeated Ref if you want to test de-duplication.
-4. Send `/start` to the bot.
-5. Press `📅 Підбірка за сьогодні`.
-6. Confirm that each Ref appears once and that a manual property post without Ref is also included if it contains a recognizable property type, location and price.
-7. Publish the collection, add another object, then press `🆕 Тільки нові об'єкти` and confirm only posts after the successful publication are included.
+Do **not** delete the existing volume or `collections.db` when deploying this update. Publication history and Undo depend on it, and valid channel-post mirror rows are useful as a fallback.
 
-## Telegram ID helper
+## Deployment test
 
-Send `/id` to the bot from the employee account. The bot replies with that account's numeric Telegram ID; add it to `ADMIN_IDS` and redeploy.
+1. Deploy this version without deleting the Railway Volume.
+2. Send `/source_status` to the bot.
+3. Press `📅 Підбірка за сьогодні`.
+4. Confirm repeated `Ref` values appear once.
+5. Confirm manual posts without `Ref` are included when they contain property type + location + price.
+6. If a source cannot be read, the bot must show a source error rather than “0 objects”.
+7. Publish a new listing after deployment and verify it appears in the next collection.
+
+## Test suite
+
+The release was checked with the existing regression suite plus new reliability tests for:
+
+- public-page retry and recovery;
+- anti-bot/empty-page handling;
+- direct-source failure with and without cache;
+- partial source failure;
+- manual posts without Ref;
+- duplicate Ref handling;
+- standard Housely footer parsing;
+- unavailable edited posts;
+- pin-only locations;
+- bed-space spelling;
+- caption markup;
+- current multi-room Housely listing format;
+- startup mirror warm-up.

@@ -4,7 +4,7 @@ import html
 import asyncio
 import sqlite3
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -60,6 +60,9 @@ SOURCE_SYNC_ENABLED = os.environ.get("SOURCE_SYNC_ENABLED", "true").strip().lowe
 SOURCE_SYNC_TIMEOUT = float(os.environ.get("SOURCE_SYNC_TIMEOUT", "6"))
 LIVE_SOURCE_MAX_PAGES = max(1, int(os.environ.get("LIVE_SOURCE_MAX_PAGES", "20")))
 LIVE_SOURCE_TIMEOUT = float(os.environ.get("LIVE_SOURCE_TIMEOUT", "8"))
+LIVE_SOURCE_RETRIES = max(1, int(os.environ.get("LIVE_SOURCE_RETRIES", "3")))
+LIVE_SOURCE_RETRY_DELAY = max(0.0, float(os.environ.get("LIVE_SOURCE_RETRY_DELAY", "0.8")))
+SOURCE_SYNC_LOOKBACK_HOURS = max(1, int(os.environ.get("SOURCE_SYNC_LOOKBACK_HOURS", "72")))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,7 +79,7 @@ PREVIEWS = {}
 EDIT_WAITING = set()
 
 # Increment when saved channel posts must be reparsed after a parser fix.
-PARSER_SCHEMA_VERSION = "3"
+PARSER_SCHEMA_VERSION = "4"
 
 
 # =========================
@@ -247,10 +250,25 @@ def extract_labeled_value(text: str, labels):
 def extract_location(text: str):
     value = extract_labeled_value(
         text,
-        [r"Локація", r"Локация", r"Location", r"Район"],
+        [r"Локація", r"Локация", r"Location", r"Район", r"Місто", r"Город"],
     )
     if value:
         return value
+
+    # Manual posts are often written simply as "📍 Lucan" without a label.
+    # Keep that location instead of grouping the object under "Інша локація".
+    for raw in (text or "").splitlines():
+        if not re.match(r"^\s*📍", raw):
+            continue
+        candidate = clean_line(raw)
+        candidate = re.sub(
+            r"^(?:Локація|Локация|Location|Район|Місто|Город)\s*:?\s*",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+        if candidate and not re.search(r"(?:мап|map|maps\.|google)", candidate, re.IGNORECASE):
+            return candidate[:120]
 
     m = re.search(r"\bDublin\s*\d{1,2}\b", text, re.IGNORECASE)
     if m:
@@ -354,7 +372,8 @@ PROPERTY_TYPE_PATTERNS = (
         (
             r"\bліжко[\s-]*місц(?:е|я|ю|і|ь)?\b",
             r"\bкойко[\s-]*мест(?:о|а|у|е)?\b",
-            r"\bbed\s*spaces?\b",
+            r"\bкойк(?:а|и|у|е)\b",
+            r"\bbed[\s-]*spaces?\b",
         ),
     ),
     ("Студія", (r"\bстуді(?:я|ї|ю|єю|ях)\b", r"\bстуди(?:я|и|ю|ей)\b", r"\bstudios?\b")),
@@ -546,10 +565,30 @@ def parse_property(text: str):
     }
 
 
+def is_inactive_property_post(text: str) -> bool:
+    """Detect a listing that was explicitly marked unavailable/closed."""
+    lines = [clean_line(raw) for raw in (text or "").splitlines() if clean_line(raw)]
+    if not lines:
+        return False
+    # Owners usually prepend one short status line and leave the old listing below it.
+    inactive_patterns = (
+        r"^(?:не\s*доступн|недоступн)",
+        r"^(?:вже|уже)\s+недоступн",
+        r"^(?:неактуальн|не\s+актуальн)",
+        r"^(?:здано|сдано)(?:\b|[.!])",
+        r"^(?:already\s+unavailable|no\s+longer\s+available|rented)(?:\b|[.!])",
+    )
+    return any(
+        re.search(pattern, line.lower(), re.IGNORECASE)
+        for line in lines[:3]
+        for pattern in inactive_patterns
+    )
+
+
 def looks_like_property_post(text: str) -> bool:
     """Reject collection/service posts while allowing manual property posts without Ref."""
     value = (text or "").strip()
-    if not value:
+    if not value or is_inactive_property_post(value):
         return False
 
     low = value.lower()
@@ -559,23 +598,24 @@ def looks_like_property_post(text: str) -> bool:
         "підбірка за сьогодні",
         "тільки нові об'єкти",
         "тільки нові об’єкти",
-        "переглядай актуальні пропозиції",
     )
     if any(marker in low for marker in collection_markers):
         return False
     if low.count("детальніше") >= 2:
         return False
 
+    real_ref = extract_ref(value)
     property_type = extract_property_type(value)
     has_price = extract_price(value) is not None
-    # Most real object posts contain a labelled location or at least a place name.
-    has_location = extract_location(value) is not None or bool(
-        re.search(
-            r"\b(?:dublin|lucan|malahide|saggart|ashbourne|bray|drogheda|galway|cork|limerick|waterford)\b",
-            value,
-            re.IGNORECASE,
-        )
-    )
+    has_location = extract_location(value) is not None
+
+    # A real Ref is generated only for property posts in the Housely channels.
+    # Do not lose such a post merely because its marketing title uses a new word
+    # that the type parser does not know yet.
+    if real_ref and (has_price or has_location):
+        return True
+
+    # Manual posts without Ref need all three independent listing signals.
     return property_type != "Житло" and has_price and has_location
 
 
@@ -622,9 +662,15 @@ def upsert_property_post(
     if username not in SOURCE_CHANNELS or not text:
         return False
 
-    parsed = parse_property(text)
+    parsed = parse_live_property(text, username, message_id)
     if not parsed:
-        # Ignore collections and any other posts without Ref.
+        # If an existing source post was edited to "Не доступно" (or otherwise
+        # stopped being a listing), remove the stale mirror row immediately.
+        with db() as conn:
+            conn.execute(
+                "DELETE FROM property_posts WHERE channel_username = ? AND message_id = ?",
+                (username, message_id),
+            )
         return False
 
     if message_date.tzinfo is None:
@@ -685,7 +731,7 @@ def upsert_property_post(
                 (username, channel_id, message_id) + values[1:],
             )
 
-    log.info("Saved Ref %s from @%s/%s", parsed["ref"], username, message_id)
+    log.info("Saved source post %s from @%s/%s", parsed["ref"], username, message_id)
     return True
 
 
@@ -715,7 +761,7 @@ def _parse_channel_page_messages(username: str, page_html: str):
         if not match or match.group(1).lower() != username:
             continue
 
-        text_node = post.select_one(".tgme_widget_message_text")
+        text_node = post.select_one(".tgme_widget_message_text, .tgme_widget_message_caption")
         time_node = post.select_one("time[datetime]")
         if text_node is None or time_node is None:
             continue
@@ -773,47 +819,51 @@ def parse_live_channel_page(username: str, page_html: str):
 
 
 async def sync_recent_source_posts():
-    """Best-effort recovery of recent source posts missed during a restart."""
+    """Warm the channel-post mirror from recent public Telegram history.
+
+    The mirror is only a fallback. It lets a freshly redeployed bot keep working
+    if Telegram later returns an anti-bot/empty public page from Railway.
+    """
     if not SOURCE_SYNC_ENABLED:
         return 0
 
-    timeout = httpx.Timeout(SOURCE_SYNC_TIMEOUT)
-    headers = {"User-Agent": "HouselyCollectionsBot/1.2"}
+    threshold_utc = datetime.now(timezone.utc) - timedelta(hours=SOURCE_SYNC_LOOKBACK_HOURS)
 
-    async def fetch_channel(client, username):
-        url = f"https://t.me/s/{username}"
+    async def fetch_channel(username):
         try:
-            response = await client.get(url)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            log.warning("Could not sync recent posts from @%s: %s", username, exc)
+            live_items = await fetch_live_channel_objects(username, threshold_utc)
+        except Exception as exc:
+            log.warning("Could not warm source mirror from @%s: %s", username, exc)
             return 0
 
         saved = 0
-        for post in parse_public_channel_page(username, response.text):
-            if upsert_property_post(
-                username=post["username"],
-                channel_id=None,
-                message_id=post["message_id"],
-                text=post["text"],
-                message_date=post["message_date"],
-            ):
-                saved += 1
+        for item in live_items:
+            try:
+                message_date = datetime.fromisoformat(
+                    str(item["created_at_utc"]).replace("Z", "+00:00")
+                )
+                if upsert_property_post(
+                    username=item["channel_username"],
+                    channel_id=None,
+                    message_id=int(item["message_id"]),
+                    text=item.get("raw_text") or item.get("description") or "",
+                    message_date=message_date,
+                ):
+                    saved += 1
+            except Exception:
+                log.exception(
+                    "Could not cache source post @%s/%s",
+                    username,
+                    item.get("message_id"),
+                )
         return saved
 
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        follow_redirects=True,
-        headers=headers,
-    ) as client:
-        counts = await asyncio.gather(
-            *(fetch_channel(client, username) for username in sorted(SOURCE_CHANNELS))
-        )
-
+    counts = await asyncio.gather(
+        *(fetch_channel(username) for username in sorted(SOURCE_CHANNELS))
+    )
     saved_count = sum(counts)
-    log.info("Source-channel sync completed: %s recent Ref post(s)", saved_count)
+    log.info("Source-channel mirror warmed: %s recent post(s)", saved_count)
     return saved_count
-
 
 def _deduplicate_and_sort(rows):
     """Legacy database de-duplication by Telegram post URL."""
@@ -1141,8 +1191,76 @@ def get_last_successful_publication_utc():
     return parsed.astimezone(timezone.utc)
 
 
+def get_cached_channel_objects(username: str, threshold_utc: datetime | None = None):
+    """Read the bot's one-row-per-Telegram-post mirror for one source channel.
+
+    This is only a reliability fallback when Telegram's public /s page returns an
+    empty/anti-bot page. It is still populated from channel_post updates, not from
+    manually entered CRM/object records.
+    """
+    username = username.lstrip("@").lower()
+    params = [username]
+    where = "channel_username = ?"
+    if threshold_utc is not None:
+        where += " AND created_at_utc >= ?"
+        params.append(threshold_utc.astimezone(timezone.utc).isoformat())
+
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM property_posts
+            WHERE {where}
+            ORDER BY created_at_utc DESC
+            """,
+            params,
+        ).fetchall()
+
+    result = []
+    for row in rows:
+        item = dict(row)
+        raw_ref = str(item.get("ref") or "")
+        item["real_ref"] = None if raw_ref.startswith("post:") else (raw_ref or None)
+        result.append(item)
+    return deduplicate_live_objects(result)
+
+
 class LiveChannelReadError(RuntimeError):
     pass
+
+
+async def _get_public_history_page(client, username: str, url: str, *, first_page: bool):
+    """Fetch one Telegram public-history page with retries.
+
+    Telegram sometimes replies HTTP 200 with a generic/anti-bot page. On the
+    first page that is an error, not proof that the channel has zero objects.
+    """
+    last_error = None
+    last_success_response = None
+    for attempt in range(1, LIVE_SOURCE_RETRIES + 1):
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            last_success_response = response
+            page_messages = _parse_channel_page_messages(username, response.text)
+            if page_messages:
+                return response, page_messages
+            last_error = LiveChannelReadError(
+                f"@{username}: Telegram returned no readable channel posts"
+            )
+        except httpx.HTTPError as exc:
+            last_error = LiveChannelReadError(f"@{username}: {exc}")
+
+        if attempt < LIVE_SOURCE_RETRIES and LIVE_SOURCE_RETRY_DELAY:
+            await asyncio.sleep(LIVE_SOURCE_RETRY_DELAY * attempt)
+
+    if not first_page and last_success_response is not None:
+        # A later page may legitimately be the end of history. The caller knows
+        # whether reaching the end here would make the requested time window incomplete.
+        return last_success_response, []
+    if last_error:
+        raise last_error
+    raise LiveChannelReadError(f"@{username}: could not read public history")
 
 
 async def fetch_live_channel_objects(username: str, threshold_utc: datetime | None = None):
@@ -1153,25 +1271,36 @@ async def fetch_live_channel_objects(username: str, threshold_utc: datetime | No
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36"
-        )
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
     }
     result = []
     before = None
     seen_message_ids = set()
+    previous_oldest_date = None
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
-        for _ in range(LIVE_SOURCE_MAX_PAGES):
+        for page_index in range(LIVE_SOURCE_MAX_PAGES):
             url = f"https://t.me/s/{username}"
             if before is not None:
                 url += f"?before={before}"
-            try:
-                response = await client.get(url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise LiveChannelReadError(f"@{username}: {exc}") from exc
 
-            page_messages = _parse_channel_page_messages(username, response.text)
+            response, page_messages = await _get_public_history_page(
+                client,
+                username,
+                url,
+                first_page=(page_index == 0),
+            )
             if not page_messages:
+                if (
+                    threshold_utc is not None
+                    and previous_oldest_date is not None
+                    and previous_oldest_date > threshold_utc
+                ):
+                    raise LiveChannelReadError(
+                        f"@{username}: public-history pagination stopped before the requested time window"
+                    )
                 break
 
             new_page_ids = [
@@ -1189,6 +1318,7 @@ async def fetch_live_channel_objects(username: str, threshold_utc: datetime | No
             oldest_message = min(page_messages, key=lambda post: post["message_id"])
             oldest_date = oldest_message["message_date"].astimezone(timezone.utc)
             earliest_id = oldest_message["message_id"]
+            previous_oldest_date = oldest_date
 
             if threshold_utc is not None and oldest_date <= threshold_utc:
                 break
@@ -1214,17 +1344,52 @@ async def get_live_properties(mode: str):
             local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
             threshold_utc = local_midnight.astimezone(timezone.utc)
 
+    async def read_one_source(username):
+        direct_error = None
+        try:
+            live_items = await fetch_live_channel_objects(username, threshold_utc)
+        except LiveChannelReadError as exc:
+            direct_error = exc
+            log.warning("Direct public-channel read failed for @%s: %s", username, exc)
+            live_items = []
+        except Exception as exc:
+            direct_error = LiveChannelReadError(f"@{username}: {exc}")
+            log.exception("Unexpected direct public-channel read failure for @%s", username)
+            live_items = []
+
+        if live_items:
+            log.info("Read %s live object(s) directly from @%s", len(live_items), username)
+            return live_items
+
+        # A successful direct read is the source of truth. If it contains no
+        # objects in the requested period, do not resurrect stale cache rows.
+        if direct_error is None:
+            log.info("No source objects found for @%s in the requested period", username)
+            return []
+
+        # If the direct public page is unavailable on Railway, use only the
+        # mirror created from real channel_post updates / startup sync.
+        cached = get_cached_channel_objects(username, threshold_utc)
+        if cached:
+            log.warning(
+                "Public history for @%s is unreadable; using %s cached channel post(s)",
+                username, len(cached),
+            )
+            return cached
+
+        # Most important safety rule: network/anti-bot failure must never be
+        # presented to the admin as "there are no objects".
+        raise direct_error
+
     results = await asyncio.gather(
-        *(fetch_live_channel_objects(username, threshold_utc) for username in sorted(SOURCE_CHANNELS)),
+        *(read_one_source(username) for username in sorted(SOURCE_CHANNELS)),
         return_exceptions=True,
     )
 
-    failures = [result for result in results if isinstance(result, Exception)]
-    if failures:
-        details = "; ".join(str(exc) for exc in failures)
-        raise LiveChannelReadError(
-            "Не вдалося повністю прочитати вихідні Telegram-канали: " + details
-        )
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        details = "; ".join(str(error) for error in errors)
+        raise LiveChannelReadError(details)
 
     candidates = [item for batch in results for item in batch]
     if mode == "today":
@@ -1233,7 +1398,8 @@ async def get_live_properties(mode: str):
         candidates = [
             item
             for item in candidates
-            if datetime.fromisoformat(item["created_at_utc"]).astimezone(timezone.utc) > threshold_utc
+            if datetime.fromisoformat(item["created_at_utc"].replace("Z", "+00:00"))
+            .astimezone(timezone.utc) > threshold_utc
         ]
 
     properties = deduplicate_live_objects(candidates)
@@ -1242,8 +1408,8 @@ async def get_live_properties(mode: str):
 
 
 async def get_verified_properties(mode: str):
-    # Telegram is now the source of truth. property_posts remains only as a
-    # legacy cache and is intentionally NOT used for Today/New collections.
+    # Source channels are the source of truth. Direct public history is preferred;
+    # the local one-row-per-channel-post mirror is only a reliability fallback.
     return await get_live_properties(mode)
 
 
@@ -1571,9 +1737,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text(
         "Housely Collections Bot\n\n"
-        "Бот читає об'єкти безпосередньо з @dublin_rent та @irelandrent, "
+        "Бот читає об'єкти з @dublin_rent та @irelandrent, "
         "прибирає дублікати й формує підбірки за сьогодні або тільки з об'єктів, "
-        "опублікованих після останньої успішної підбірки.",
+        "опублікованих після останньої успішної підбірки. Якщо публічна сторінка Telegram "
+        "тимчасово не віддає історію, бот використовує власне дзеркало постів каналів.",
         reply_markup=home_keyboard(),
     )
 
@@ -1598,9 +1765,9 @@ async def create_collection_preview(update: Update, mode: str):
     except LiveChannelReadError as exc:
         log.warning("Live channel read failed while creating preview: %s", exc)
         await q.message.reply_text(
-            "⚠️ Не вдалося прочитати всі вихідні канали напряму. "
-            "Підбірку не сформовано, щоб не показати неповні або застарілі дані.\n\n"
-            "Спробуйте Regenerate ще раз через кілька секунд.",
+            "⚠️ Не вдалося надійно прочитати один із вихідних каналів. "
+            "Я не показую порожню підбірку, щоб випадково не пропустити об'єкти.\n\n"
+            "Спробуйте ще раз через кілька секунд. Якщо повториться — надішліть /source_status.",
             reply_markup=home_keyboard(),
         )
         return
@@ -1669,8 +1836,9 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except LiveChannelReadError as exc:
         log.warning("Live channel read failed while regenerating: %s", exc)
         await q.edit_message_text(
-            "⚠️ Не вдалося прочитати всі вихідні канали напряму. "
-            "Спробуйте Regenerate ще раз через кілька секунд.",
+            "⚠️ Не вдалося надійно прочитати один із вихідних каналів. "
+            "Я не показую порожню підбірку, щоб випадково не пропустити об'єкти.\n\n"
+            "Спробуйте ще раз через кілька секунд. Якщо повториться — надішліть /source_status.",
             reply_markup=home_keyboard(),
         )
         return
@@ -1963,6 +2131,59 @@ async def undo_publication(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only diagnostic that does not change any data."""
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await deny(update)
+        return
+
+    now_local = datetime.now(TZ)
+    local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
+    threshold_utc = local_midnight.astimezone(timezone.utc)
+    lines = ["🩺 Перевірка джерел:"]
+
+    try:
+        me = await context.bot.get_me()
+        bot_id = me.id
+    except Exception:
+        bot_id = None
+
+    for username in sorted(SOURCE_CHANNELS):
+        try:
+            live_items = await fetch_live_channel_objects(username, threshold_utc)
+            direct = f"direct: {len(live_items)}"
+        except Exception as exc:
+            direct = f"direct: ERROR ({type(exc).__name__})"
+
+        cached = get_cached_channel_objects(username, threshold_utc)
+        membership = "unknown"
+        if bot_id is not None:
+            try:
+                member = await context.bot.get_chat_member(f"@{username}", bot_id)
+                membership = str(getattr(member, "status", "unknown"))
+            except Exception:
+                membership = "not available"
+
+        lines.append(
+            f"@{username} — {direct}, cache: {len(cached)}, bot: {membership}"
+        )
+
+    lines.append(
+        "\nЯкщо direct=ERROR і cache=0, бот не має надійного джерела старих постів за сьогодні. "
+        "Для стабільного cache бот має бути доданий у вихідні канали."
+    )
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def warm_sources_on_startup(application):
+    try:
+        await sync_recent_source_posts()
+    except Exception:
+        # Startup warm-up is a reliability aid only; never prevent the bot itself from launching.
+        log.exception("Source mirror warm-up failed")
+
+
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # MessageHandler with ChatType.CHANNEL reaches both normal and edited channel messages.
     if not (update.channel_post or update.edited_channel_post):
@@ -1984,10 +2205,11 @@ def main():
     validate_config()
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(warm_sources_on_startup).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", debug_id))
+    app.add_handler(CommandHandler("source_status", source_status))
 
     # Watch source channel posts.
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post), group=1)

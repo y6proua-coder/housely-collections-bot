@@ -880,3 +880,341 @@ class TestAsyncSourceChecks(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_live_property_with_standard_footer_is_not_rejected():
+    text = """🏡 Здається кімната в Dublin 15
+📍 Локація: Dublin 15
+💶 Оренда: 1250€
+👤 Для однієї особи з роботою/студент(ка)
+Ref 0000920
+⸻
+Переглядай актуальні пропозиції житла в нашому офіційному телеграм каналі:
+🔗 https://t.me/irelandrent
+⸻"""
+    parsed = main.parse_live_property(text, "irelandrent", 12345)
+    assert parsed is not None
+    assert parsed["real_ref"] == "0000920"
+
+
+def test_generated_collection_is_still_rejected():
+    text = """🆕 Нові актуальні пропозиції
+🏠 Кімнати
+📍 Dublin 15
+• 🏠 Кімната — €1,250 → Детальніше
+📍 Dublin 24
+• 🏠 Кімната — €1,000 → Детальніше"""
+    assert main.parse_live_property(text, "irelandrent", 99999) is None
+
+class TestV072Reliability(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_db_path = main.DB_PATH
+        self.old_sources = main.SOURCE_CHANNELS
+        self.old_retries = main.LIVE_SOURCE_RETRIES
+        self.old_retry_delay = main.LIVE_SOURCE_RETRY_DELAY
+        self.old_sync_lookback = main.SOURCE_SYNC_LOOKBACK_HOURS
+        main.DB_PATH = Path(self.temp_dir.name) / "collections.db"
+        main.SOURCE_CHANNELS = {"irelandrent"}
+        main.LIVE_SOURCE_RETRIES = 3
+        main.LIVE_SOURCE_RETRY_DELAY = 0
+        main.SOURCE_SYNC_LOOKBACK_HOURS = 72
+        main.init_db()
+
+    def tearDown(self):
+        main.DB_PATH = self.old_db_path
+        main.SOURCE_CHANNELS = self.old_sources
+        main.LIVE_SOURCE_RETRIES = self.old_retries
+        main.LIVE_SOURCE_RETRY_DELAY = self.old_retry_delay
+        main.SOURCE_SYNC_LOOKBACK_HOURS = self.old_sync_lookback
+        self.temp_dir.cleanup()
+
+    def test_pin_only_location_is_parsed(self):
+        text = "🏠 Кімната для пари\n📍 Lucan, Co. Dublin\n💶 €750"
+        parsed = main.parse_live_property(text, "irelandrent", 1)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["location"], "Lucan, Co. Dublin")
+
+    def test_bed_space_hyphen_is_recognized(self):
+        self.assertEqual(
+            main.extract_property_type("Bed-space available in Dublin 24"),
+            "Ліжко-місце",
+        )
+
+    def test_ref_listing_with_new_type_word_is_not_lost(self):
+        text = (
+            "Нова житлова пропозиція\n"
+            "📍 Локація: Dublin 3\n"
+            "💶 Оренда: €1,500\n"
+            "Ref 1234"
+        )
+        parsed = main.parse_live_property(text, "irelandrent", 77)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["real_ref"], "0001234")
+
+    def test_inactive_listing_is_rejected_even_if_old_body_remains(self):
+        text = (
+            "Не доступно\n"
+            "🏡 Здається кімната в Dublin 8\n"
+            "📍 Локація: Dublin 8\n"
+            "💶 Оренда: €1,100\n"
+            "Ref 1234"
+        )
+        self.assertIsNone(main.parse_live_property(text, "irelandrent", 77))
+
+    def test_edit_to_unavailable_removes_stale_cache_row(self):
+        now = datetime.now(timezone.utc)
+        live_text = (
+            "🏡 Здається кімната в Dublin 8\n"
+            "📍 Локація: Dublin 8\n"
+            "💶 Оренда: €1,100\n"
+            "Ref 1234"
+        )
+        self.assertTrue(main.upsert_property_post("irelandrent", -1001, 77, live_text, now))
+        self.assertEqual(len(main.get_cached_channel_objects("irelandrent")), 1)
+
+        unavailable = "Не доступно\n" + live_text
+        self.assertFalse(main.upsert_property_post("irelandrent", -1001, 77, unavailable, now))
+        self.assertEqual(main.get_cached_channel_objects("irelandrent"), [])
+
+    async def test_first_public_page_empty_retries_then_raises(self):
+        response = SimpleNamespace(text="<html>Telegram</html>", raise_for_status=lambda: None)
+        client = AsyncMock()
+        client.get.return_value = response
+
+        with self.assertRaises(main.LiveChannelReadError):
+            await main._get_public_history_page(
+                client,
+                "irelandrent",
+                "https://t.me/s/irelandrent",
+                first_page=True,
+            )
+        self.assertEqual(client.get.await_count, 3)
+
+    async def test_first_public_page_recovers_on_second_try(self):
+        empty = SimpleNamespace(text="<html>Telegram</html>", raise_for_status=lambda: None)
+        valid = SimpleNamespace(
+            text="""
+            <div class=\"tgme_widget_message\" data-post=\"irelandrent/10\">
+              <div class=\"tgme_widget_message_text\">🏠 Кімната<br>📍 Dublin 8<br>💶 €900</div>
+              <time datetime=\"2026-09-14T12:00:00+00:00\"></time>
+            </div>
+            """,
+            raise_for_status=lambda: None,
+        )
+        client = AsyncMock()
+        client.get.side_effect = [empty, valid]
+        response, messages = await main._get_public_history_page(
+            client,
+            "irelandrent",
+            "https://t.me/s/irelandrent",
+            first_page=True,
+        )
+        self.assertIs(response, valid)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(client.get.await_count, 2)
+
+    async def test_direct_failure_with_empty_cache_is_error_not_false_zero(self):
+        with patch.object(
+            main,
+            "fetch_live_channel_objects",
+            new=AsyncMock(side_effect=main.LiveChannelReadError("blocked")),
+        ):
+            with self.assertRaises(main.LiveChannelReadError):
+                await main.get_live_properties("today")
+
+    async def test_direct_failure_uses_real_channel_cache(self):
+        now = datetime.now(timezone.utc)
+        text = (
+            "🏡 Здається кімната в Dublin 8\n"
+            "📍 Локація: Dublin 8\n"
+            "💶 Оренда: €1,100\n"
+            "Ref 1234"
+        )
+        main.upsert_property_post("irelandrent", -1001, 77, text, now)
+        with patch.object(
+            main,
+            "fetch_live_channel_objects",
+            new=AsyncMock(side_effect=main.LiveChannelReadError("blocked")),
+        ):
+            rows, hidden, missing = await main.get_live_properties("today")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["real_ref"], "0001234")
+        self.assertEqual(hidden, 0)
+        self.assertEqual(missing, [])
+
+    async def test_startup_sync_caches_manual_post_without_ref(self):
+        now = datetime.now(timezone.utc)
+        item = {
+            "id": None,
+            "channel_username": "irelandrent",
+            "channel_id": None,
+            "message_id": 222,
+            "ref": "post:irelandrent:222",
+            "real_ref": None,
+            "location": "Lucan",
+            "price": "€750",
+            "description": "Кімната",
+            "property_type": "Кімната",
+            "audience": None,
+            "post_url": "https://t.me/irelandrent/222",
+            "raw_text": "🏠 Кімната\n📍 Lucan\n💶 €750",
+            "local_date": now.astimezone(main.TZ).date().isoformat(),
+            "created_at_utc": now.isoformat(),
+            "updated_at_utc": now.isoformat(),
+        }
+        with patch.object(
+            main,
+            "fetch_live_channel_objects",
+            new=AsyncMock(return_value=[item]),
+        ):
+            saved = await main.sync_recent_source_posts()
+        self.assertEqual(saved, 1)
+        cached = main.get_cached_channel_objects("irelandrent")
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0]["ref"], "post:irelandrent:222")
+
+    def test_caption_markup_is_supported(self):
+        html = """
+        <div class=\"tgme_widget_message\" data-post=\"irelandrent/333\">
+          <div class=\"tgme_widget_message_caption\">🏠 Кімната<br>📍 Lucan<br>💶 €750</div>
+          <time datetime=\"2026-09-14T12:00:00+00:00\"></time>
+        </div>
+        """
+        rows = main.parse_live_channel_page("irelandrent", html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["message_id"], 333)
+
+class TestV072RealFormats(unittest.TestCase):
+    def test_current_multi_room_format_with_footer_parses(self):
+        text = """🏡 Здаються кімнати в Dublin 15
+📍 Локація: Dublin 15
+💶 1 кімната: велика кімната з двоспальним ліжком -1300€
+💶 2 кімната: двоспальне ліжко - 1250€
+👤 Для однієї особи/пари або двох друзів з роботою або студенти
+🏠 В будинку 3 кімнати, без власників
+📝 Для запису на перегляд пишіть @team_housely
+Ref 0000920
+⸻
+Переглядай актуальні пропозиції житла в нашому офіційному телеграм каналі:
+🔗 https://t.me/irelandrent
+⸻"""
+        parsed = main.parse_live_property(text, "irelandrent", 920)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["real_ref"], "0000920")
+        self.assertEqual(parsed["property_type"], "Кімната")
+        self.assertEqual(parsed["location"], "Dublin 15")
+        self.assertEqual(parsed["price"], "€1,300")
+
+    def test_blank_rent_line_uses_first_actual_price(self):
+        text = """🏡 Здається 2-кімнатний мобільний будинок в Co. Kildare
+📍 Локація: Co. Kildare
+💶 Оренда:
+👤 Для однієї особи з роботою/студент(ка) - 800€
+👥 Для пари з роботою/студенти - 1000€
+Ref 0000609"""
+        parsed = main.parse_live_property(text, "dublin_rent", 609)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["price"], "€800")
+        self.assertEqual(parsed["property_type"], "Будинок")
+
+
+class TestV072PartialFailure(unittest.IsolatedAsyncioTestCase):
+    async def test_one_unreadable_source_prevents_partial_collection(self):
+        old_sources = main.SOURCE_CHANNELS
+        main.SOURCE_CHANNELS = {"dublin_rent", "irelandrent"}
+        try:
+            now = datetime.now(timezone.utc)
+            good = {
+                "id": None,
+                "channel_username": "irelandrent",
+                "channel_id": None,
+                "message_id": 1,
+                "ref": "0000001",
+                "real_ref": "0000001",
+                "location": "Dublin 1",
+                "price": "€900",
+                "description": "Кімната",
+                "property_type": "Кімната",
+                "audience": None,
+                "post_url": "https://t.me/irelandrent/1",
+                "raw_text": "Кімната",
+                "local_date": now.astimezone(main.TZ).date().isoformat(),
+                "created_at_utc": now.isoformat(),
+                "updated_at_utc": now.isoformat(),
+            }
+
+            async def fake_fetch(username, threshold):
+                if username == "dublin_rent":
+                    raise main.LiveChannelReadError("blocked")
+                return [good]
+
+            with patch.object(main, "fetch_live_channel_objects", side_effect=fake_fetch), \
+                 patch.object(main, "get_cached_channel_objects", return_value=[]):
+                with self.assertRaises(main.LiveChannelReadError):
+                    await main.get_live_properties("today")
+        finally:
+            main.SOURCE_CHANNELS = old_sources
+
+class TestV072SourceTruth(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_direct_empty_does_not_resurrect_cache(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        old_db_path = main.DB_PATH
+        old_sources = main.SOURCE_CHANNELS
+        main.DB_PATH = Path(temp_dir.name) / "collections.db"
+        main.SOURCE_CHANNELS = {"irelandrent"}
+        main.init_db()
+        try:
+            now = datetime.now(timezone.utc)
+            main.upsert_property_post(
+                "irelandrent",
+                -1001,
+                55,
+                "🏠 Кімната\n📍 Dublin 8\n💶 €900\nRef 555",
+                now,
+            )
+            with patch.object(
+                main,
+                "fetch_live_channel_objects",
+                new=AsyncMock(return_value=[]),
+            ):
+                rows, hidden, missing = await main.get_live_properties("today")
+            self.assertEqual(rows, [])
+            self.assertEqual(hidden, 0)
+            self.assertEqual(missing, [])
+        finally:
+            main.DB_PATH = old_db_path
+            main.SOURCE_CHANNELS = old_sources
+            temp_dir.cleanup()
+
+    async def test_pagination_stopping_before_threshold_is_error(self):
+        old_retries = main.LIVE_SOURCE_RETRIES
+        old_delay = main.LIVE_SOURCE_RETRY_DELAY
+        old_pages = main.LIVE_SOURCE_MAX_PAGES
+        main.LIVE_SOURCE_RETRIES = 1
+        main.LIVE_SOURCE_RETRY_DELAY = 0
+        main.LIVE_SOURCE_MAX_PAGES = 3
+        try:
+            first = SimpleNamespace(
+                text="""
+                <div class=\"tgme_widget_message\" data-post=\"irelandrent/500\">
+                  <div class=\"tgme_widget_message_text\">🏠 Кімната<br>📍 Dublin 8<br>💶 €900<br>Ref 500</div>
+                  <time datetime=\"2026-09-14T18:00:00+00:00\"></time>
+                </div>
+                """,
+                raise_for_status=lambda: None,
+            )
+            empty = SimpleNamespace(text="<html>Telegram</html>", raise_for_status=lambda: None)
+            fake_client = AsyncMock()
+            fake_client.get.side_effect = [first, empty]
+            fake_client.__aenter__.return_value = fake_client
+            fake_client.__aexit__.return_value = None
+
+            threshold = datetime(2026, 9, 14, 0, 0, tzinfo=timezone.utc)
+            with patch.object(main.httpx, "AsyncClient", return_value=fake_client):
+                with self.assertRaises(main.LiveChannelReadError):
+                    await main.fetch_live_channel_objects("irelandrent", threshold)
+        finally:
+            main.LIVE_SOURCE_RETRIES = old_retries
+            main.LIVE_SOURCE_RETRY_DELAY = old_delay
+            main.LIVE_SOURCE_MAX_PAGES = old_pages
