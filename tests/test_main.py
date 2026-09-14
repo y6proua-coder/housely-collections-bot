@@ -670,6 +670,53 @@ class TestPublicChannelRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["ref"] for row in rows], ["0000937"])
 
 
+class TestLiveChannelSource(unittest.TestCase):
+    def test_live_parser_accepts_manual_post_without_ref(self):
+        html = """
+        <div class="tgme_widget_message" data-post="dublin_rent/3001">
+          <div class="tgme_widget_message_text">
+            🛏 Ліжко-місце для одного чоловіка<br>
+            📍 Локація: Dublin 3<br>
+            💶 Вартість: €620
+          </div>
+          <time datetime="2026-09-14T12:00:00+00:00"></time>
+        </div>
+        """
+        rows = main.parse_live_channel_page("dublin_rent", html)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["real_ref"])
+        self.assertEqual(rows[0]["ref"], "post:dublin_rent:3001")
+        self.assertEqual(rows[0]["post_url"], "https://t.me/dublin_rent/3001")
+
+    def test_live_dedup_uses_ref_and_keeps_newest_post(self):
+        first = property_item(1)
+        first["real_ref"] = "0000999"
+        first["ref"] = "0000999"
+        first["created_at_utc"] = "2026-09-14T10:00:00+00:00"
+        second = property_item(2)
+        second["real_ref"] = "0000999"
+        second["ref"] = "0000999"
+        second["created_at_utc"] = "2026-09-14T11:00:00+00:00"
+
+        rows = main.deduplicate_live_objects([first, second])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["post_url"], second["post_url"])
+
+    def test_collection_post_is_not_parsed_as_property(self):
+        html = """
+        <div class="tgme_widget_message" data-post="dublin_rent/3002">
+          <div class="tgme_widget_message_text">
+            🆕 Нові актуальні пропозиції<br>
+            📍 Dublin 3<br>
+            • 🛏 Ліжко-місце — €620 → Детальніше<br>
+            • 🏠 Кімната — €900 → Детальніше
+          </div>
+          <time datetime="2026-09-14T13:00:00+00:00"></time>
+        </div>
+        """
+        self.assertEqual(main.parse_live_channel_page("dublin_rent", html), [])
+
+
 class TestPreviewPublicationSeparation(unittest.IsolatedAsyncioTestCase):
     async def test_preview_does_not_create_publication_record(self):
         temp_dir = tempfile.TemporaryDirectory()

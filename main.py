@@ -58,6 +58,8 @@ SOURCE_SYNC_ENABLED = os.environ.get("SOURCE_SYNC_ENABLED", "true").strip().lowe
     "0", "false", "no", "off"
 }
 SOURCE_SYNC_TIMEOUT = float(os.environ.get("SOURCE_SYNC_TIMEOUT", "6"))
+LIVE_SOURCE_MAX_PAGES = max(1, int(os.environ.get("LIVE_SOURCE_MAX_PAGES", "20")))
+LIVE_SOURCE_TIMEOUT = float(os.environ.get("LIVE_SOURCE_TIMEOUT", "8"))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -544,6 +546,65 @@ def parse_property(text: str):
     }
 
 
+def looks_like_property_post(text: str) -> bool:
+    """Reject collection/service posts while allowing manual property posts without Ref."""
+    value = (text or "").strip()
+    if not value:
+        return False
+
+    low = value.lower()
+    collection_markers = (
+        "актуальне житло на сьогодні",
+        "нові актуальні пропозиції",
+        "підбірка за сьогодні",
+        "тільки нові об'єкти",
+        "тільки нові об’єкти",
+        "переглядай актуальні пропозиції",
+    )
+    if any(marker in low for marker in collection_markers):
+        return False
+    if low.count("детальніше") >= 2:
+        return False
+
+    property_type = extract_property_type(value)
+    has_price = extract_price(value) is not None
+    # Most real object posts contain a labelled location or at least a place name.
+    has_location = extract_location(value) is not None or bool(
+        re.search(
+            r"\b(?:dublin|lucan|malahide|saggart|ashbourne|bray|drogheda|galway|cork|limerick|waterford)\b",
+            value,
+            re.IGNORECASE,
+        )
+    )
+    return property_type != "Житло" and has_price and has_location
+
+
+def parse_live_property(text: str, username: str, message_id: int):
+    """Parse a live channel post. Ref is preferred but is not required."""
+    if not looks_like_property_post(text):
+        return None
+
+    ref = extract_ref(text)
+    location = extract_location(text) or "Інша локація"
+    price = extract_price(text) or "Ціна в пості"
+    audience = extract_audience(text)
+    description = extract_description(text, location)
+    property_type = extract_property_type(text)
+
+    # collection_publication_items.ref is NOT NULL. Manual posts without Ref use
+    # a stable internal identity based on their Telegram post.
+    internal_ref = ref or f"post:{username.lstrip('@').lower()}:{message_id}"
+    return {
+        "ref": internal_ref,
+        "real_ref": ref,
+        "location": location,
+        "price": price,
+        "description": description,
+        "property_type": property_type,
+        "audience": audience,
+    }
+
+
 # =========================
 # STORAGE
 # =========================
@@ -642,8 +703,8 @@ def save_channel_post(update: Update):
     )
 
 
-def parse_public_channel_page(username: str, page_html: str):
-    """Read recent public Telegram posts so a redeploy cannot hide their Refs."""
+def _parse_channel_page_messages(username: str, page_html: str):
+    """Extract timestamped text messages from a public Telegram channel page."""
     username = username.lstrip("@").lower()
     soup = BeautifulSoup(page_html or "", "html.parser")
     result = []
@@ -662,13 +723,12 @@ def parse_public_channel_page(username: str, page_html: str):
         for br in text_node.find_all("br"):
             br.replace_with("\n")
         text = text_node.get_text("", strip=False).strip()
-        if not extract_ref(text):
-            continue
-
         try:
             message_date = datetime.fromisoformat(time_node["datetime"].replace("Z", "+00:00"))
         except (KeyError, TypeError, ValueError):
             continue
+        if message_date.tzinfo is None:
+            message_date = message_date.replace(tzinfo=timezone.utc)
 
         result.append({
             "username": username,
@@ -677,6 +737,38 @@ def parse_public_channel_page(username: str, page_html: str):
             "message_date": message_date,
         })
 
+    return result
+
+
+def parse_public_channel_page(username: str, page_html: str):
+    """Legacy Ref-only parser used only for the local cache."""
+    return [
+        post
+        for post in _parse_channel_page_messages(username, page_html)
+        if extract_ref(post["text"])
+    ]
+
+
+def parse_live_channel_page(username: str, page_html: str):
+    """Parse live channel objects directly, including manual posts without Ref."""
+    result = []
+    for post in _parse_channel_page_messages(username, page_html):
+        parsed = parse_live_property(post["text"], post["username"], post["message_id"])
+        if not parsed:
+            continue
+        message_date_utc = post["message_date"].astimezone(timezone.utc)
+        result.append({
+            "id": None,
+            "channel_username": post["username"],
+            "channel_id": None,
+            "message_id": post["message_id"],
+            **parsed,
+            "post_url": f"https://t.me/{post['username']}/{post['message_id']}",
+            "raw_text": post["text"],
+            "local_date": message_date_utc.astimezone(TZ).date().isoformat(),
+            "created_at_utc": message_date_utc.isoformat(),
+            "updated_at_utc": message_date_utc.isoformat(),
+        })
     return result
 
 
@@ -724,7 +816,7 @@ async def sync_recent_source_posts():
 
 
 def _deduplicate_and_sort(rows):
-    """Keep every distinct Telegram post, even when two posts share a Ref."""
+    """Legacy database de-duplication by Telegram post URL."""
     latest_by_post = {}
     for row in rows:
         item = dict(row)
@@ -735,6 +827,44 @@ def _deduplicate_and_sort(rows):
             latest_by_post[post_key] = item
 
     result = list(latest_by_post.values())
+    result.sort(key=collection_sort_key)
+    return result
+
+
+def _normalize_signature_part(value: str | None) -> str:
+    value = (value or "").lower().replace("’", "'")
+    value = re.sub(r"https?://\S+|@\w+", " ", value)
+    value = re.sub(r"\bref\s*[:#-]?\s*0*\d{3,}\b", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"[^\w€]+", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def live_object_key(item):
+    """One object = one row. A real Ref wins; otherwise normalized text is used."""
+    raw_ref = str(item.get("ref") or "")
+    real_ref = item.get("real_ref") or (raw_ref if raw_ref and not raw_ref.startswith("post:") else None)
+    if real_ref:
+        return f"ref:{real_ref}"
+
+    normalized_raw = _normalize_signature_part(item.get("raw_text"))
+    if normalized_raw:
+        return f"text:{normalized_raw}"
+    return "post:" + str(
+        item.get("post_url") or f"{item.get('channel_username')}:{item.get('message_id')}"
+    )
+
+
+def deduplicate_live_objects(rows):
+    """Remove repeated objects across pages/channels, keeping the newest live post."""
+    newest_by_object = {}
+    for row in rows:
+        item = dict(row)
+        key = live_object_key(item)
+        previous = newest_by_object.get(key)
+        if previous is None or (item.get("created_at_utc") or "") > (previous.get("created_at_utc") or ""):
+            newest_by_object[key] = item
+
+    result = list(newest_by_object.values())
     result.sort(key=collection_sort_key)
     return result
 
@@ -984,13 +1114,137 @@ async def get_verified_uncollected_properties():
     return properties[:MAX_ITEMS], hidden_count, missing
 
 
+def get_last_successful_publication_utc():
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT MAX(cp.created_at_utc) AS created_at_utc
+            FROM collection_publications AS cp
+            WHERE cp.deleted_at_utc IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM collection_publication_messages AS cpm
+                  WHERE cpm.publication_id = cp.id
+                    AND cpm.deleted_at_utc IS NULL
+              )
+            """
+        ).fetchone()
+    value = row["created_at_utc"] if row else None
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+class LiveChannelReadError(RuntimeError):
+    pass
+
+
+async def fetch_live_channel_objects(username: str, threshold_utc: datetime | None = None):
+    """Read public Telegram history page-by-page. No property DB is consulted."""
+    username = username.lstrip("@").lower()
+    timeout = httpx.Timeout(LIVE_SOURCE_TIMEOUT)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36"
+        )
+    }
+    result = []
+    before = None
+    seen_message_ids = set()
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        for _ in range(LIVE_SOURCE_MAX_PAGES):
+            url = f"https://t.me/s/{username}"
+            if before is not None:
+                url += f"?before={before}"
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise LiveChannelReadError(f"@{username}: {exc}") from exc
+
+            page_messages = _parse_channel_page_messages(username, response.text)
+            if not page_messages:
+                break
+
+            new_page_ids = [
+                post["message_id"]
+                for post in page_messages
+                if post["message_id"] not in seen_message_ids
+            ]
+            if not new_page_ids:
+                break
+            seen_message_ids.update(new_page_ids)
+
+            live_items = parse_live_channel_page(username, response.text)
+            result.extend(item for item in live_items if item["message_id"] in new_page_ids)
+
+            oldest_message = min(page_messages, key=lambda post: post["message_id"])
+            oldest_date = oldest_message["message_date"].astimezone(timezone.utc)
+            earliest_id = oldest_message["message_id"]
+
+            if threshold_utc is not None and oldest_date <= threshold_utc:
+                break
+            if before is not None and earliest_id >= before:
+                break
+            before = earliest_id
+
+    return result
+
+
+async def get_live_properties(mode: str):
+    if mode not in {"today", "new"}:
+        raise ValueError(f"Unknown collection mode: {mode}")
+
+    now_local = datetime.now(TZ)
+    today = now_local.date().isoformat()
+    if mode == "today":
+        local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
+        threshold_utc = local_midnight.astimezone(timezone.utc)
+    else:
+        threshold_utc = get_last_successful_publication_utc()
+        if threshold_utc is None:
+            local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
+            threshold_utc = local_midnight.astimezone(timezone.utc)
+
+    results = await asyncio.gather(
+        *(fetch_live_channel_objects(username, threshold_utc) for username in sorted(SOURCE_CHANNELS)),
+        return_exceptions=True,
+    )
+
+    failures = [result for result in results if isinstance(result, Exception)]
+    if failures:
+        details = "; ".join(str(exc) for exc in failures)
+        raise LiveChannelReadError(
+            "Не вдалося повністю прочитати вихідні Telegram-канали: " + details
+        )
+
+    candidates = [item for batch in results for item in batch]
+    if mode == "today":
+        candidates = [item for item in candidates if item.get("local_date") == today]
+    elif threshold_utc is not None:
+        candidates = [
+            item
+            for item in candidates
+            if datetime.fromisoformat(item["created_at_utc"]).astimezone(timezone.utc) > threshold_utc
+        ]
+
+    properties = deduplicate_live_objects(candidates)
+    hidden_count = max(0, len(properties) - MAX_ITEMS)
+    return properties[:MAX_ITEMS], hidden_count, []
+
+
 async def get_verified_properties(mode: str):
-    # Re-read recent public channel posts first. This makes the database
-    # resilient to Railway restarts and catches manual posts by their Ref.
-    await sync_recent_source_posts()
-    if mode == "new":
-        return await get_verified_uncollected_properties()
-    return await get_verified_today_properties()
+    # Telegram is now the source of truth. property_posts remains only as a
+    # legacy cache and is intentionally NOT used for Today/New collections.
+    return await get_live_properties(mode)
 
 
 # =========================
@@ -1317,8 +1571,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text(
         "Housely Collections Bot\n\n"
-        "Бот збирає нові об'єкти з @dublin_rent та @irelandrent "
-        "і формує компактні підбірки за сьогодні або тільки з об'єктів, "
+        "Бот читає об'єкти безпосередньо з @dublin_rent та @irelandrent, "
+        "прибирає дублікати й формує підбірки за сьогодні або тільки з об'єктів, "
         "опублікованих після останньої успішної підбірки.",
         reply_markup=home_keyboard(),
     )
@@ -1339,7 +1593,17 @@ async def create_collection_preview(update: Update, mode: str):
         return
 
     await q.answer()
-    properties, hidden_count, missing = await get_verified_properties(mode)
+    try:
+        properties, hidden_count, missing = await get_verified_properties(mode)
+    except LiveChannelReadError as exc:
+        log.warning("Live channel read failed while creating preview: %s", exc)
+        await q.message.reply_text(
+            "⚠️ Не вдалося прочитати всі вихідні канали напряму. "
+            "Підбірку не сформовано, щоб не показати неповні або застарілі дані.\n\n"
+            "Спробуйте Regenerate ще раз через кілька секунд.",
+            reply_markup=home_keyboard(),
+        )
+        return
 
     if not properties:
         if mode == "new":
@@ -1351,9 +1615,7 @@ async def create_collection_preview(update: Update, mode: str):
             )
         else:
             empty_text = (
-                "Сьогодні я ще не бачив жодного нового об'єкта.\n\n"
-                "Важливо: бот бачить тільки пости, опубліковані після того, "
-                "як він був запущений і доданий у канал."
+                "Сьогодні у вихідних каналах немає об'єктів для підбірки."
             )
         await q.message.reply_text(
             empty_text,
@@ -1402,7 +1664,16 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer("Оновлено")
     preview = PREVIEWS.get(user.id, {})
     mode = preview.get("mode", "today")
-    properties, hidden_count, missing = await get_verified_properties(mode)
+    try:
+        properties, hidden_count, missing = await get_verified_properties(mode)
+    except LiveChannelReadError as exc:
+        log.warning("Live channel read failed while regenerating: %s", exc)
+        await q.edit_message_text(
+            "⚠️ Не вдалося прочитати всі вихідні канали напряму. "
+            "Спробуйте Regenerate ще раз через кілька секунд.",
+            reply_markup=home_keyboard(),
+        )
+        return
     if not properties:
         empty_text = (
             "Нових невикористаних об'єктів немає."

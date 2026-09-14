@@ -1,67 +1,36 @@
 # Housely Collections Bot
 
-Bot for compact daily housing collections.
+Bot for compact housing collections built directly from the public Telegram source channels.
 
-## What it does
+## What changed in this version
 
-- Watches new property posts directly in `@dublin_rent` and `@irelandrent`.
-- Collects posts published manually or by any bot. The Publish Bot database is
-  not used: a new post with a new `Ref` in a source channel is enough.
-- Before every Preview, also reloads recent public posts from both source
-  channels. This restores recent Refs missed during a Railway restart or
-  redeploy.
-- Reads only posts that contain a `Ref`.
-- Treats every Telegram post as a separate object by its channel link/message
-  ID. Repeated Refs do not make a newer post disappear.
-- Extracts Ref, location, price, object type, audience and original post URL.
-- Provides two collection modes:
-  - `📅 Підбірка за сьогодні` — all current objects published today.
-  - `🆕 Тільки нові об'єкти` — every object post published after the most recent
-    successfully published collection.
-- Moves the New-mode time boundary only after at least one channel publication
-  succeeds. Creating, editing, regenerating or cancelling a Preview does not
-  move it.
-- Groups the collection by object type (rooms first, then bedspaces,
-  apartments, studios, houses), and by location inside every type.
-- Uses compact item titles: object type + audience + price + `Детальніше`.
-  Marketing phrases from the original title are not copied into a collection.
-  If the type cannot be recognized, the post is still included without a type
-  heading or an invented type name.
-- Preview buttons: Publish / Edit / Regenerate / Cancel.
-- Can publish to the main channel, either object channel, or both object channels.
-- Before every Preview/Regenerate, checks the public Telegram source links and
-  removes posts that were deleted directly in the channel from SQLite.
-- Keeps `Детальніше` links clickable after manual editing. If a collection is
-  pasted back as plain text, the bot rebuilds the links and restores standard
-  bold formatting for the title, type headings, locations, prices and footer.
-- After publishing, shows `Скасувати й видалити публікацію`. The button deletes
-  every copy created by that publish action. After a complete undo, those
-  objects become available in `Тільки нові об'єкти` again.
-- Automatically adds the mandatory official-channel footer to the end of every
-  collection and replaces a copied/plain footer with the canonical formatting.
+The source of truth for `📅 Підбірка за сьогодні` and `🆕 Тільки нові об'єкти` is now Telegram itself, not the `property_posts` SQLite table.
 
-## Important limitation
+- Before every Preview/Regenerate, the bot opens the public history of `@dublin_rent` and `@irelandrent`.
+- It paginates backwards far enough to cover the requested period, instead of reading only one recent page.
+- `Підбірка за сьогодні` takes posts whose Telegram publication date is today in `Europe/Dublin`.
+- `Тільки нові об'єкти` takes posts published after the last successfully published collection. If there has never been a successful collection, it starts from today's midnight.
+- Duplicate objects are removed before rendering. If posts have a real `Ref`, one `Ref` appears only once and the newest channel post is kept, even if it exists in both channels or was reposted.
+- Manual property posts without `Ref` can also be included. They receive an internal post identity only for publication tracking; the identity is never shown to users.
+- Generated collection posts are ignored so the bot does not parse its own collections back as housing objects.
+- If one of the source channels cannot be read, the bot does **not** silently fall back to stale database data. It stops that Preview and asks you to retry, preventing an incomplete collection.
 
-Telegram Bot API does not provide arbitrary channel-history backfill. The bot
-collects posts delivered to it while it is an administrator in the source
-channels; polling also keeps pending updates enabled. The public-channel sync
-recovers recent posts automatically. If a much older post is no longer present
-on the public preview page and was missed entirely, repost or edit it after the
-bot is running so Telegram sends a new update.
+The old `property_posts` table and channel update handler remain in the project as a legacy cache, but they are no longer used to build Today/New collections. SQLite is still required for publication history, undo, and the "last successful collection" boundary.
 
-For the first test:
-1. Deploy the bot.
-2. Publish one **new** property post with a `Ref` in `@dublin_rent` or `@irelandrent`.
-3. Send `/start` to the bot in private chat.
-4. Press `📅 Підбірка за сьогодні` or `🆕 Тільки нові об'єкти`.
+## Collection format
 
-`Тільки нові об'єкти` is based only on the time of the last successful
-publication. Deployment or restart time never moves that boundary. A successful
-`Підбірка за сьогодні` publication also becomes the new boundary for New mode.
+The bot extracts location, price, object type, audience and original Telegram post URL, then groups objects by type and location. It keeps `Детальніше` links clickable and restores standard formatting after manual edits.
+
+Modes:
+
+- `📅 Підбірка за сьогодні` — live objects published today in the two source channels.
+- `🆕 Тільки нові об'єкти` — live objects published after the last successful collection.
+
+Preview controls remain: Publish / Edit / Regenerate / Cancel. Publishing can go to the main channel, either object channel, or both object channels. The undo button deletes all copies created by that publication and restores the previous New-mode boundary behavior.
 
 ## Railway Variables
 
-Add:
+Required:
 
 - `BOT_TOKEN`
 - `ADMIN_IDS`
@@ -72,20 +41,21 @@ Add:
 - `TIMEZONE=Europe/Dublin`
 - `MAX_ITEMS=25`
 - `DATA_DIR=/app/data`
+
+Live channel reading:
+
+- `LIVE_SOURCE_MAX_PAGES=20` — maximum public-history pages read per source channel for one collection.
+- `LIVE_SOURCE_TIMEOUT=8` — timeout in seconds for each Telegram public-page request.
+
+Legacy cache/check settings can remain unchanged; they are not the source for Today/New collections:
+
 - `VERIFY_SOURCE_POSTS=true`
 - `POST_CHECK_TIMEOUT=8`
 - `POST_CHECK_CONCURRENCY=8`
 - `SOURCE_SYNC_ENABLED=true`
 - `SOURCE_SYNC_TIMEOUT=6`
 
-The source channels must stay public for live deletion checks. A temporary
-Telegram/network error is fail-safe: the item remains in the collection. Only a
-definitive "post not found" response removes it from the local database.
-
-The bot must be an administrator in both source channels so it receives manual
-and automated channel posts. It also needs permission to post in every
-destination channel. To use the undo button, it needs permission to delete
-messages in those channels.
+The source channels must be public because the collection builder reads `https://t.me/s/<channel>` history directly. The bot should still be an administrator in destination channels so it can publish and, if required, delete messages with Undo.
 
 Multiple admins example:
 
@@ -93,15 +63,18 @@ Multiple admins example:
 
 ## Persistent database
 
-The bot uses SQLite at `/app/data/collections.db`. Existing databases are
-migrated automatically; do not delete the Railway Volume during deployment.
+SQLite is stored at `/app/data/collections.db`. Keep the Railway Volume mounted at `/app/data`. The database is now used mainly for successful-publication history and Undo; it is no longer the primary source of property objects for collection creation.
 
-For persistent storage, add a Railway Volume mounted at:
+## Test after deployment
 
-`/app/data`
+1. Deploy this version.
+2. Ensure `@dublin_rent` and `@irelandrent` are public.
+3. Publish or manually add several property posts, including a repeated Ref if you want to test de-duplication.
+4. Send `/start` to the bot.
+5. Press `📅 Підбірка за сьогодні`.
+6. Confirm that each Ref appears once and that a manual property post without Ref is also included if it contains a recognizable property type, location and price.
+7. Publish the collection, add another object, then press `🆕 Тільки нові об'єкти` and confirm only posts after the successful publication are included.
 
-Without a Volume, the test database can disappear after redeploy/restart.
+## Telegram ID helper
 
-## How an employee finds their Telegram ID
-
-Send `/id` to this bot from that Telegram account. The bot replies with that account's own numeric Telegram ID. Add it to `ADMIN_IDS` and redeploy.
+Send `/id` to the bot from the employee account. The bot replies with that account's numeric Telegram ID; add it to `ADMIN_IDS` and redeploy.
