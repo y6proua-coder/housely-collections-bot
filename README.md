@@ -1,5 +1,15 @@
 # Housely Collections Bot
 
+## v0.7.3 — updated collection message templates
+
+Both collection modes now use the approved Ukrainian intro, with different headlines:
+
+- **Today:** `🏡 Всім привіт! Зібрали для вас підбірку новинок за сьогодні!`
+- **Only new:** `🆕 Нові пропозиції житла вже тут!`
+
+The introduction above the generated property list is identical in both modes: viewing prompt, invitation to contact Housely about a viewing, and clickable links to `https://t.me/team_housely` and WhatsApp `+353 89 448 4275` (`https://wa.me/353894484275`). The existing end-of-post channel footer remains unchanged. Property selection, collection history, Undo and database settings are unchanged.
+
+
 ## v0.7.2 — channel reliability fix
 
 This version focuses on the exact failure seen after v0.7.1: the bot could show **“Сьогодні ... немає об'єктів”** even when the source channels contained listings.

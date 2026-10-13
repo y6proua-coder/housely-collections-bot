@@ -324,7 +324,38 @@ class TestCollectionBuilder(unittest.TestCase):
 
     def test_new_collection_has_distinct_title(self):
         text = main.build_collection([property_item(1)], mode="new")
-        self.assertIn("Нові актуальні пропозиції", text)
+        self.assertTrue(text.startswith("🆕 <b>Нові пропозиції житла вже тут!</b>"))
+        self.assertNotIn("підбірку новинок за сьогодні", text)
+
+    def test_today_collection_title_mentions_today_new_arrivals(self):
+        text = main.build_collection([property_item(1)], mode="today")
+        self.assertTrue(text.startswith(
+            "🏡 <b>Всім привіт! Зібрали для вас підбірку новинок за сьогодні!</b>"
+        ))
+        self.assertNotIn("Актуальне житло на сьогодні", text)
+
+    def test_both_modes_share_approved_intro_and_clickable_contacts(self):
+        for mode in ("today", "new"):
+            with self.subTest(mode=mode):
+                text = main.build_collection([property_item(1)], mode=mode)
+                self.assertIn("Переглядайте нові пропозиції житла нижче 👇", text)
+                self.assertIn(
+                    "🔑 Сподобався варіант? Не відкладайте - зв'яжіться з нами, "
+                    "щоб дізнатися деталі та домовитися про перегляд.",
+                    text,
+                )
+                self.assertIn("📩 <b>Контакти для зв'язку:</b>", text)
+                self.assertIn(
+                    '<a href="https://t.me/team_housely">https://t.me/team_housely</a>',
+                    text,
+                )
+                self.assertIn(
+                    '<a href="https://wa.me/353894484275">+353 89 448 4275</a>',
+                    text,
+                )
+                # Contact details belong above the property listings.
+                self.assertLess(text.index("📩"), text.index("📍 <b>Dublin 1</b>"))
+                self.assertEqual(text.count("https://wa.me/353894484275"), 1)
 
     def test_collection_shows_hidden_count(self):
         text = main.build_collection([property_item(1)], hidden_count=4)
@@ -780,6 +811,38 @@ class TestFormattingRestoration(unittest.TestCase):
         )
         self.assertEqual(restored.count("Переглядай актуальні пропозиції"), 1)
 
+    def test_contact_links_regain_clickable_format_after_plaintext_edit(self):
+        sample = main.build_collection([property_item(1)])
+        plain = main.visible_html_text(sample)
+        restored = main.restore_collection_contact_links(plain)
+        self.assertIn(
+            '<a href="https://t.me/team_housely">https://t.me/team_housely</a>',
+            restored,
+        )
+        self.assertIn(
+            '<a href="https://wa.me/353894484275">+353 89 448 4275</a>',
+            restored,
+        )
+        # A second pass should not duplicate the link or contact block.
+        self.assertEqual(main.restore_collection_contact_links(restored), restored)
+
+    def test_new_titles_regain_bold_after_plaintext_edit(self):
+        for title, fragment in (
+            (
+                "🏡 Всім привіт! Зібрали для вас підбірку новинок за сьогодні!",
+                "🏡 <b>Всім привіт! Зібрали для вас підбірку новинок за сьогодні!</b>",
+            ),
+            (
+                "🆕 Нові пропозиції житла вже тут!",
+                "🆕 <b>Нові пропозиції житла вже тут!</b>",
+            ),
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(
+                    main.restore_standard_collection_formatting(title, []),
+                    fragment,
+                )
+
     def test_existing_manual_bold_is_preserved(self):
         item = property_item(1)
         line = (
@@ -895,6 +958,13 @@ Ref 0000920
     parsed = main.parse_live_property(text, "irelandrent", 12345)
     assert parsed is not None
     assert parsed["real_ref"] == "0000920"
+
+
+def test_updated_generated_collections_are_not_parsed_as_listings():
+    for mode in ("today", "new"):
+        text = main.build_collection([property_item(1)], mode=mode)
+        assert main.looks_like_property_post(main.visible_html_text(text)) is False
+        assert main.parse_live_property(main.visible_html_text(text), "irelandrent", 99999) is None
 
 
 def test_generated_collection_is_still_rejected():

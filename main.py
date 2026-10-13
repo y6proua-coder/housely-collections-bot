@@ -595,6 +595,8 @@ def looks_like_property_post(text: str) -> bool:
     collection_markers = (
         "актуальне житло на сьогодні",
         "нові актуальні пропозиції",
+        "нові пропозиції житла вже тут",
+        "зібрали для вас підбірку новинок за сьогодні",
         "підбірка за сьогодні",
         "тільки нові об'єкти",
         "тільки нові об’єкти",
@@ -1456,13 +1458,42 @@ def ensure_collection_footer(text: str) -> str:
     return f"{text}\n\n{canonical_footer}" if text else canonical_footer
 
 
-def build_collection(properties, hidden_count=0, mode="today"):
+def build_collection_intro(mode: str) -> str:
+    """Shared Housely greeting/contacts; only the headline changes by mode."""
     title = (
-        "🆕 <b>Нові актуальні пропозиції</b>"
+        "🆕 <b>Нові пропозиції житла вже тут!</b>"
         if mode == "new"
-        else "🏡 <b>Актуальне житло на сьогодні</b>"
+        else "🏡 <b>Всім привіт! Зібрали для вас підбірку новинок за сьогодні!</b>"
     )
-    parts = [title, ""]
+    return (
+        f"{title}\n\n"
+        "Переглядайте нові пропозиції житла нижче 👇\n\n"
+        "🔑 Сподобався варіант? Не відкладайте - зв'яжіться з нами, "
+        "щоб дізнатися деталі та домовитися про перегляд.\n\n"
+        "📩 <b>Контакти для зв'язку:</b>\n\n"
+        '• <b>Telegram: <a href="https://t.me/team_housely">'
+        'https://t.me/team_housely</a></b>\n'
+        '• <b>WhatsApp: <a href="https://wa.me/353894484275">'
+        '+353 89 448 4275</a></b>'
+    )
+
+
+def restore_collection_contact_links(edited_html: str) -> str:
+    """Keep the approved contact links clickable after a plain-text Edit paste."""
+    canonical_lines = build_collection_intro("today").splitlines()
+    contact_lines = {
+        visible_html_text(line).strip(): line
+        for line in canonical_lines
+        if "<a href=" in line
+    }
+    return "\n".join(
+        contact_lines.get(visible_html_text(line).strip(), line)
+        for line in (edited_html or "").splitlines()
+    )
+
+
+def build_collection(properties, hidden_count=0, mode="today"):
+    parts = [build_collection_intro(mode), ""]
 
     by_type = {}
     for item in properties:
@@ -1628,7 +1659,10 @@ def restore_standard_collection_formatting(edited_html: str, properties):
             continue
 
         if line_number == 0 and (
-            "актуальне житло" in low or "нові актуальні пропозиції" in low
+            "актуальне житло" in low
+            or "нові актуальні пропозиції" in low
+            or "зібрали для вас підбірку новинок за сьогодні" in low
+            or "нові пропозиції житла вже тут" in low
         ):
             restored_lines.append(_bold_whole_label(visible))
             continue
@@ -1910,6 +1944,7 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # previous implementation escaped message.text, which deliberately turned
     # every clickable "Детальніше" into plain black text.
     edited_html = (message.text_html or html.escape(new_text)).strip()
+    edited_html = restore_collection_contact_links(edited_html)
     edited_html = restore_missing_detail_links(
         edited_html,
         preview.get("properties", []),
