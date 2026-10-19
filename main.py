@@ -4,6 +4,7 @@ import html
 import asyncio
 import sqlite3
 import logging
+import secrets
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -74,6 +75,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("housely-collections")
+BOT_VERSION = "0.8.2"
 
 # Temporary preview/editor state. It is okay for this to reset on redeploy in MVP.
 PREVIEWS = {}
@@ -1016,6 +1018,24 @@ def exclude_collected_properties(properties):
     ]
 
 
+def publication_history_stats():
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT cp.id) AS publications,
+                   COUNT(DISTINCT cpi.post_url) AS posts
+            FROM collection_publications AS cp
+            LEFT JOIN collection_publication_items AS cpi ON cpi.publication_id = cp.id
+            WHERE cp.deleted_at_utc IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM collection_publication_messages AS cpm
+                  WHERE cpm.publication_id = cp.id AND cpm.deleted_at_utc IS NULL
+              )
+            """
+        ).fetchone()
+    return dict(row)
+
+
 def record_publication(admin_user_id: int, mode: str, text_html: str, properties, messages):
     """Persist one publish action so it can be undone and excluded from New."""
     now_utc = datetime.now(timezone.utc).isoformat()
@@ -1478,8 +1498,13 @@ async def get_live_properties(mode: str):
         candidates = [item for item in candidates if item.get("local_date") == today]
 
     candidates = [item for item in candidates if not is_inactive_property_post(item.get("raw_text", ""))]
+    available_count = len(candidates)
     if mode == "new":
         candidates = exclude_collected_properties(candidates)
+    log.info(
+        "Collection mode=%s | lookback_days=%s | available=%s | excluded_used=%s | matched=%s",
+        mode, COLLECTION_LOOKBACK_DAYS, available_count, available_count - len(candidates), len(candidates),
+    )
 
     properties = deduplicate_live_objects(candidates)
     hidden_count = max(0, len(properties) - MAX_ITEMS)
@@ -1792,33 +1817,55 @@ def home_keyboard():
     ])
 
 
-def preview_keyboard():
+def preview_action(action: str, token: str | None = None):
+    return f"{action}:{token}" if token else action
+
+
+async def current_preview(update: Update):
+    """An older message must never act on another, newer collection."""
+    q = update.callback_query
+    preview = PREVIEWS.get(update.effective_user.id)
+    if not preview:
+        await q.answer("Preview не знайдено. Створіть нову підбірку.", show_alert=True)
+        return None
+    token = preview.get("token")
+    callback_token = str(getattr(q, "data", "") or "").partition(":")[2]
+    if token and callback_token != token:
+        await q.answer(
+            "Цей Preview застарів: ви вже створили іншу підбірку. Скористайтеся її кнопками або створіть нову.",
+            show_alert=True,
+        )
+        return None
+    return preview
+
+
+def preview_keyboard(token=None):
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Publish", callback_data="publish_menu"),
-            InlineKeyboardButton("✏️ Edit", callback_data="edit_preview"),
+            InlineKeyboardButton("✅ Publish", callback_data=preview_action("publish_menu", token)),
+            InlineKeyboardButton("✏️ Edit", callback_data=preview_action("edit_preview", token)),
         ],
         [
-            InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel_preview"),
+            InlineKeyboardButton("🔄 Regenerate", callback_data=preview_action("regenerate", token)),
+            InlineKeyboardButton("❌ Cancel", callback_data=preview_action("cancel_preview", token)),
         ],
     ])
 
 
-def destination_keyboard():
+def destination_keyboard(token=None):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⭐ Головний канал", callback_data="dest_main")],
-        [InlineKeyboardButton("📢 Інші канали", callback_data="dest_other")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_preview")],
+        [InlineKeyboardButton("⭐ Головний канал", callback_data=preview_action("dest_main", token))],
+        [InlineKeyboardButton("📢 Інші канали", callback_data=preview_action("dest_other", token))],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=preview_action("back_preview", token))],
     ])
 
 
-def other_channels_keyboard():
+def other_channels_keyboard(token=None):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏙 Dublin channel", callback_data="dest_dublin")],
-        [InlineKeyboardButton("🇮🇪 Ireland channel", callback_data="dest_ireland")],
-        [InlineKeyboardButton("📢 Обидва канали", callback_data="dest_both")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="publish_menu")],
+        [InlineKeyboardButton("🏙 Dublin channel", callback_data=preview_action("dest_dublin", token))],
+        [InlineKeyboardButton("🇮🇪 Ireland channel", callback_data=preview_action("dest_ireland", token))],
+        [InlineKeyboardButton("📢 Обидва канали", callback_data=preview_action("dest_both", token))],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=preview_action("publish_menu", token))],
     ])
 
 
@@ -1848,7 +1895,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.effective_message.reply_text(
-        "Housely Collections Bot\n\n"
+        f"Housely Collections Bot v{BOT_VERSION}\n\n"
         "Бот читає об'єкти з @dublin_rent та @irelandrent, "
         "прибирає дублікати й пропускає пости з позначкою недоступності.\n\n"
         "🆕 Тільки свіжі пости - вільні об'єкти за останні 3 тижні, яких ще не було в опублікованих підбірках.\n"
@@ -1911,7 +1958,9 @@ async def create_collection_preview(update: Update, mode: str):
         "properties": visible_properties,
         "hidden_count": hidden_count,
         "mode": mode,
+        "token": secrets.token_hex(6),
     }
+    EDIT_WAITING.discard(user.id)
 
     if missing:
         await q.message.reply_text(
@@ -1923,7 +1972,7 @@ async def create_collection_preview(update: Update, mode: str):
         text,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(),
+        reply_markup=preview_keyboard(PREVIEWS[user.id]["token"]),
     )
 
 
@@ -1947,8 +1996,10 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
+    preview = await current_preview(update)
+    if preview is None:
+        return
     await q.answer("Оновлено")
-    preview = PREVIEWS.get(user.id, {})
     mode = preview.get("mode", "all")
     try:
         properties, hidden_count, missing = await get_verified_properties(mode)
@@ -1967,6 +2018,8 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if mode == "new"
             else "Немає вільних об'єктів за останні 3 тижні для підбірки."
         )
+        PREVIEWS.pop(user.id, None)
+        EDIT_WAITING.discard(user.id)
         await q.edit_message_text(empty_text, reply_markup=home_keyboard())
         return
 
@@ -1977,7 +2030,9 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "properties": visible_properties,
         "hidden_count": hidden_count,
         "mode": mode,
+        "token": secrets.token_hex(6),
     }
+    EDIT_WAITING.discard(user.id)
 
     if missing:
         await q.message.reply_text(
@@ -1989,7 +2044,7 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(),
+        reply_markup=preview_keyboard(PREVIEWS[user.id]["token"]),
     )
 
 
@@ -2000,8 +2055,7 @@ async def edit_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
-    if user.id not in PREVIEWS:
-        await q.answer("Спочатку створіть підбірку.", show_alert=True)
+    if await current_preview(update) is None:
         return
 
     EDIT_WAITING.add(user.id)
@@ -2049,7 +2103,7 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         edited_html,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(),
+        reply_markup=preview_keyboard(preview.get("token")),
     )
 
 
@@ -2060,14 +2114,16 @@ async def publish_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
-    if user.id not in PREVIEWS:
-        await q.answer("Спочатку створіть підбірку.", show_alert=True)
+    preview = await current_preview(update)
+    if preview is None:
         return
 
     await q.answer()
     await q.message.reply_text(
-        "Куди опублікувати підбірку?",
-        reply_markup=destination_keyboard(),
+        "Куди опублікувати підбірку?\n\n" + (
+            "🆕 Тільки свіжі пости" if preview.get("mode") == "new" else "🏡 Усі вільні"
+        ),
+        reply_markup=destination_keyboard(preview.get("token")),
     )
 
 
@@ -2078,8 +2134,11 @@ async def dest_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
+    preview = await current_preview(update)
+    if preview is None:
+        return
     await q.answer()
-    await q.edit_message_text("Оберіть канал:", reply_markup=other_channels_keyboard())
+    await q.edit_message_text("Оберіть канал:", reply_markup=other_channels_keyboard(preview.get("token")))
 
 
 async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destinations):
@@ -2089,9 +2148,8 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
         await deny(update)
         return
 
-    preview = PREVIEWS.get(user.id)
-    if not preview:
-        await q.answer("Preview не знайдено.", show_alert=True)
+    preview = await current_preview(update)
+    if preview is None:
         return
 
     await q.answer("Публікую…")
@@ -2101,7 +2159,7 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
         await q.message.reply_text(
             "⚠️ Частина постів уже старша за 3 тижні. "
             "Натисніть Regenerate, щоб оновити підбірку.",
-            reply_markup=preview_keyboard(),
+            reply_markup=preview_keyboard(preview.get("token")),
         )
         return
     unused = exclude_collected_properties(properties) if preview.get("mode") == "new" else properties
@@ -2109,7 +2167,7 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
         await q.message.reply_text(
             "⚠️ Частина цих постів уже потрапила в іншу підбірку. "
             "Натисніть Regenerate, щоб оновити список свіжих постів.",
-            reply_markup=preview_keyboard(),
+            reply_markup=preview_keyboard(preview.get("token")),
         )
         return
     try:
@@ -2118,14 +2176,14 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
         await q.message.reply_text(
             "⚠️ Не вдалося перевірити, чи всі об'єкти ще вільні. "
             "Спробуйте опублікувати ще раз через кілька секунд.",
-            reply_markup=preview_keyboard(),
+            reply_markup=preview_keyboard(preview.get("token")),
         )
         return
     if inactive:
         await q.message.reply_text(
             "⚠️ Частина об'єктів уже недоступна або їхні пости видалено. "
             "Натисніть Regenerate, щоб створити актуальну підбірку.",
-            reply_markup=preview_keyboard(),
+            reply_markup=preview_keyboard(preview.get("token")),
         )
         return
     sent_to = []
@@ -2162,7 +2220,10 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
             )
         except Exception as exc:
             log.exception("Published collection could not be recorded")
-            errors.append(f"Не вдалося зберегти кнопку скасування: {exc}")
+            errors.append(
+                "Історію підбірки не збережено: ці пости можуть повторитися в режимі свіжих. "
+                "Перевірте /source_status."
+            )
 
     result = "✅ Опубліковано:\n" + "\n".join(sent_to) if sent_to else "❌ Не вдалося опублікувати."
     if errors:
@@ -2185,7 +2246,7 @@ async def destination_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "dest_ireland": [IRELAND_CHANNEL],
         "dest_both": [DUBLIN_CHANNEL, IRELAND_CHANNEL],
     }
-    await publish_to(update, context, mapping[update.callback_query.data])
+    await publish_to(update, context, mapping[update.callback_query.data.split(":", 1)[0]])
 
 
 async def back_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2195,9 +2256,8 @@ async def back_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
-    preview = PREVIEWS.get(user.id)
-    if not preview:
-        await q.answer("Preview не знайдено.", show_alert=True)
+    preview = await current_preview(update)
+    if preview is None:
         return
 
     await q.answer()
@@ -2205,7 +2265,7 @@ async def back_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview["text"],
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(),
+        reply_markup=preview_keyboard(preview.get("token")),
     )
 
 
@@ -2216,6 +2276,8 @@ async def cancel_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
+    if await current_preview(update) is None:
+        return
     PREVIEWS.pop(user.id, None)
     EDIT_WAITING.discard(user.id)
     await q.answer("Скасовано")
@@ -2298,7 +2360,18 @@ async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now_local = datetime.now(TZ)
     local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
     threshold_utc = local_midnight.astimezone(timezone.utc)
-    lines = ["🩺 Перевірка джерел:"]
+    stats = publication_history_stats()
+    lines = [
+        f"🩺 Перевірка джерел | v{BOT_VERSION}",
+        f"Збережених опублікованих підбірок: {stats['publications']}",
+        f"Постів в історії: {stats['posts']}",
+        f"Період обох режимів: останній {COLLECTION_LOOKBACK_DAYS} день.",
+    ]
+    if not stats["publications"]:
+        lines.append(
+            "Історія публікацій порожня. Поки підбірку не опубліковано через Publish, "
+            "свіжі та всі вільні можуть містити однакові об'єкти."
+        )
 
     try:
         me = await context.bot.get_me()
@@ -2375,19 +2448,19 @@ def main():
     app.add_handler(CallbackQueryHandler(create_today, pattern=r"^create_today$"))
     app.add_handler(CallbackQueryHandler(create_all, pattern=r"^create_all$"))
     app.add_handler(CallbackQueryHandler(create_new, pattern=r"^create_new$"))
-    app.add_handler(CallbackQueryHandler(regenerate, pattern=r"^regenerate$"))
-    app.add_handler(CallbackQueryHandler(edit_preview, pattern=r"^edit_preview$"))
-    app.add_handler(CallbackQueryHandler(publish_menu, pattern=r"^publish_menu$"))
-    app.add_handler(CallbackQueryHandler(dest_other, pattern=r"^dest_other$"))
+    app.add_handler(CallbackQueryHandler(regenerate, pattern=r"^regenerate(?::[0-9a-f]{12})?$"))
+    app.add_handler(CallbackQueryHandler(edit_preview, pattern=r"^edit_preview(?::[0-9a-f]{12})?$"))
+    app.add_handler(CallbackQueryHandler(publish_menu, pattern=r"^publish_menu(?::[0-9a-f]{12})?$"))
+    app.add_handler(CallbackQueryHandler(dest_other, pattern=r"^dest_other(?::[0-9a-f]{12})?$"))
     app.add_handler(
         CallbackQueryHandler(
             destination_router,
-            pattern=r"^(dest_main|dest_dublin|dest_ireland|dest_both)$",
+            pattern=r"^(dest_main|dest_dublin|dest_ireland|dest_both)(?::[0-9a-f]{12})?$",
         )
     )
-    app.add_handler(CallbackQueryHandler(back_preview, pattern=r"^back_preview$"))
+    app.add_handler(CallbackQueryHandler(back_preview, pattern=r"^back_preview(?::[0-9a-f]{12})?$"))
     app.add_handler(CallbackQueryHandler(back_home, pattern=r"^back_home$"))
-    app.add_handler(CallbackQueryHandler(cancel_preview, pattern=r"^cancel_preview$"))
+    app.add_handler(CallbackQueryHandler(cancel_preview, pattern=r"^cancel_preview(?::[0-9a-f]{12})?$"))
     app.add_handler(CallbackQueryHandler(undo_publication, pattern=r"^undo_publish:\d+$"))
 
     app.add_handler(
@@ -2395,7 +2468,7 @@ def main():
     )
 
     me = app.bot
-    log.info("Starting Housely Collections Bot | admins=%s | db=%s", sorted(ADMIN_IDS), DB_PATH)
+    log.info("Starting Housely Collections Bot v%s | admins=%s | db=%s", BOT_VERSION, sorted(ADMIN_IDS), DB_PATH)
     app.run_polling(
         allowed_updates=["message", "callback_query", "channel_post", "edited_channel_post"],
         drop_pending_updates=False,

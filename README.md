@@ -1,6 +1,16 @@
 # Housely Collections Bot
 
-## v0.8.1 - fresh posts or all available listings from the last 3 weeks
+## v0.8.2 - correct preview buttons and publication history diagnostics
+
+Fixed a reproducible bug: after creating a Fresh preview and then an All preview (or the reverse), Publish on the older message used the most recently created preview. All preview, edit, regenerate, cancel and destination buttons now carry the preview's own identity. An outdated button shows an alert instead of acting on another collection. Regenerate without a valid preview no longer silently switches to All. Starting a new preview cancels a pending edit of the previous one.
+
+The difference between the modes depends on **successful publication through Publish**. If all eligible posts are unused, both modes correctly contain the same listings; creating, viewing or cancelling a preview does not use its posts. After publishing, those posts remain in All and are excluded from Fresh. Undo can restore them while they remain within the 21-day window. Publication history must remain in the same persistent `/app/data/collections.db` across deployments.
+
+`/source_status` now shows the running version, the number of saved active collections and the number of posts in their history. If those counts unexpectedly return to zero after a restart, check that the existing persistent data volume is still mounted. A history-save failure after publication is now reported explicitly instead of being described only as an Undo-button error. Source-selection logs also show the number of previously used posts excluded by Fresh.
+
+An end-to-end regression test creates a preview, opens its publishing menu, publishes through its destination callback, reopens the database and confirms that Fresh excludes the published posts while All still contains them. No live Telegram messages are sent by tests.
+
+## Current selection rules
 
 Both modes use a rolling **21-day window** from the time a collection is generated. A post published exactly 21 days ago is included; older posts are excluded. The original Telegram publication date is used, so editing a post does not renew its age. The window is checked again before publishing a saved preview.
 

@@ -250,6 +250,80 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         rows = main.filter_recent_properties([boundary, expired, invalid], now_utc=TEST_NOW)
         self.assertEqual([row["message_id"] for row in rows], [2])
 
+    async def test_older_preview_buttons_cannot_publish_newer_mode(self):
+        first, second = query_update(), query_update()
+        with patch.object(main, "get_verified_properties", new=AsyncMock(side_effect=[([item(2)], 0, []), ([item(3)], 0, [])])):
+            await main.create_collection_preview(first, "new")
+            first_token = main.PREVIEWS[123].get("token")
+            await main.create_collection_preview(second, "all")
+        first.callback_query.data = "dest_main" + (":" + first_token if first_token else "")
+        sent = SimpleNamespace(chat=SimpleNamespace(id=-100), message_id=100)
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(return_value=sent)))
+        with patch.object(main, "check_source_post", new=AsyncMock(return_value=True)):
+            await main.publish_to(first, context, ["@main"])
+        context.bot.send_message.assert_not_awaited()
+
+    async def test_create_publish_then_fresh_and_all_diverge_and_history_survives_restart(self):
+        source = [item(2), item(3)]
+        update = query_update()
+        sent = SimpleNamespace(chat=SimpleNamespace(id=-100), message_id=100)
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(return_value=sent)))
+        with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=source)), \
+             patch.object(main, "check_source_post", new=AsyncMock(return_value=True)):
+            # With an unused inventory, both lists are intentionally identical.
+            fresh_before, _, _ = await main.get_live_properties("new")
+            all_before, _, _ = await main.get_live_properties("all")
+            self.assertEqual(fresh_before, all_before)
+            await main.create_collection_preview(update, "all")
+            token = main.PREVIEWS[123]["token"]
+            update.callback_query.data = f"publish_menu:{token}"
+            await main.publish_menu(update, context)
+            menu = update.callback_query.message.reply_text.await_args.kwargs["reply_markup"]
+            update.callback_query.data = menu.inline_keyboard[0][0].callback_data
+            await main.destination_router(update, context)
+            context.bot.send_message.assert_awaited_once()
+            main.PREVIEWS.clear()
+            main.init_db()
+            fresh_after, _, _ = await main.get_live_properties("new")
+            all_after, _, _ = await main.get_live_properties("all")
+        self.assertEqual(fresh_after, [])
+        self.assertEqual({row["post_url"] for row in all_after}, {row["post_url"] for row in source})
+        self.assertEqual(main.publication_history_stats(), {"publications": 1, "posts": 2})
+
+    async def test_stale_edit_cancel_regenerate_and_menu_do_not_affect_latest_preview(self):
+        main.PREVIEWS[123] = {"mode": "all", "text": "latest", "properties": [item(3)], "token": "123456abcdef"}
+        for action, handler in (
+            ("edit_preview", main.edit_preview), ("cancel_preview", main.cancel_preview),
+            ("regenerate", main.regenerate), ("publish_menu", main.publish_menu),
+            ("dest_other", main.dest_other), ("back_preview", main.back_preview),
+        ):
+            with self.subTest(action=action):
+                update = query_update()
+                update.callback_query.data = f"{action}:abcdef123456"
+                await handler(update, None)
+                self.assertEqual(main.PREVIEWS[123]["text"], "latest")
+                self.assertEqual(main.PREVIEWS[123]["mode"], "all")
+                self.assertTrue(update.callback_query.answer.await_args.kwargs["show_alert"])
+
+    async def test_regenerate_without_preview_never_falls_back_to_all_mode(self):
+        update = query_update()
+        update.callback_query.data = "regenerate"
+        with patch.object(main, "get_verified_properties", new=AsyncMock()) as get_properties:
+            await main.regenerate(update, None)
+        get_properties.assert_not_awaited()
+
+    async def test_new_preview_cancels_pending_edit_of_previous_preview(self):
+        main.EDIT_WAITING.add(123)
+        with patch.object(main, "get_verified_properties", new=AsyncMock(return_value=([item(2)], 0, []))):
+            await main.create_collection_preview(query_update(), "new")
+        self.assertNotIn(123, main.EDIT_WAITING)
+
+    def test_all_preview_controls_carry_their_own_token(self):
+        for keyboard in (main.preview_keyboard("abcdef123456"), main.destination_keyboard("abcdef123456"), main.other_channels_keyboard("abcdef123456")):
+            for row in keyboard.inline_keyboard:
+                for button in row:
+                    self.assertTrue(button.callback_data.endswith(":abcdef123456"))
+
 
 class TestAvailabilityAndPagination(unittest.IsolatedAsyncioTestCase):
     def test_exact_housely_marker_is_rejected_anywhere_in_listing(self):
