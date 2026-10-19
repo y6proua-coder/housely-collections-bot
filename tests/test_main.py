@@ -684,8 +684,11 @@ class TestPublicChannelRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Ref 0000937", posts[0]["text"])
 
     async def test_source_sync_recovers_post_after_empty_redeploy_database(self):
+        recent_date = datetime.now(timezone.utc).isoformat()
         response = SimpleNamespace(
-            text=self.channel_page_html(),
+            text='<section class="tgme_channel_history">' + self.channel_page_html().replace(
+                "2026-09-03T18:25:00+00:00", recent_date
+            ) + '</section>',
             raise_for_status=lambda: None,
         )
         fake_client = AsyncMock()

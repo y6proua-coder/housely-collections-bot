@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -12,9 +12,17 @@ import main
 
 
 LISTING = "🏠 Кімната\n📍 Dublin 8\n💶 €900\nRef 1234"
+TEST_NOW = datetime(2026, 10, 19, 10, 0, tzinfo=timezone.utc)
+
+
+class FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return TEST_NOW.astimezone(tz) if tz else TEST_NOW.replace(tzinfo=None)
 
 
 def item(number, raw_text=LISTING):
+    posted_at = TEST_NOW - timedelta(days=14) + timedelta(minutes=number)
     return {
         "id": None,
         "channel_username": "irelandrent",
@@ -28,8 +36,8 @@ def item(number, raw_text=LISTING):
         "audience": None,
         "post_url": f"https://t.me/irelandrent/{number}",
         "raw_text": raw_text,
-        "local_date": "2025-01-01",
-        "created_at_utc": f"2025-01-01T10:{number:02}:00+00:00",
+        "local_date": posted_at.astimezone(main.TZ).date().isoformat(),
+        "created_at_utc": posted_at.isoformat(),
     }
 
 
@@ -49,6 +57,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "SOURCE_CHANNELS", {"irelandrent"}),
             patch.object(main, "ADMIN_IDS", {123}),
             patch.object(main.httpx, "AsyncClient", return_value=AsyncMock()),
+            patch.object(main, "datetime", FixedDateTime),
         ]
         for p in self.patches:
             p.start()
@@ -73,7 +82,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[used, omitted])) as fetch:
             rows, _, _ = await main.get_live_properties("new")
         self.assertEqual([row["ref"] for row in rows], [omitted["ref"]])
-        fetch.assert_awaited_once_with("irelandrent", None)
+        fetch.assert_awaited_once_with("irelandrent", TEST_NOW - timedelta(days=21))
 
     async def test_first_new_collection_has_no_midnight_cutoff(self):
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[item(2)])):
@@ -86,7 +95,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[old])) as fetch:
             rows, _, _ = await main.get_live_properties("all")
         self.assertEqual(len(rows), 1)
-        fetch.assert_awaited_once_with("irelandrent", None)
+        fetch.assert_awaited_once_with("irelandrent", TEST_NOW - timedelta(days=21))
 
     async def test_publication_in_all_mode_consumes_posts_for_fresh_mode(self):
         self.publish_record([item(2)], mode="all")
@@ -138,7 +147,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual([row["message_id"] for row in rows], [2])
 
     async def test_fallback_checks_current_caption_even_if_verification_disabled(self):
-        main.upsert_property_post("irelandrent", -1001, 2, LISTING, datetime.now(timezone.utc))
+        main.upsert_property_post("irelandrent", -1001, 2, LISTING, TEST_NOW)
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(side_effect=main.LiveChannelReadError("blocked"))), \
              patch.object(main, "check_source_post", new=AsyncMock(return_value=False)) as check, \
              patch.object(main, "VERIFY_SOURCE_POSTS", False):
@@ -148,7 +157,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main.get_cached_channel_objects("irelandrent"), [])
 
     async def test_unknown_fallback_availability_is_error(self):
-        main.upsert_property_post("irelandrent", -1001, 2, LISTING, datetime.now(timezone.utc))
+        main.upsert_property_post("irelandrent", -1001, 2, LISTING, TEST_NOW)
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(side_effect=main.LiveChannelReadError("blocked"))), \
              patch.object(main, "check_source_post", new=AsyncMock(return_value=None)):
             with self.assertRaises(main.LiveChannelReadError):
@@ -182,6 +191,64 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
     def test_home_has_exactly_two_modes(self):
         buttons = [button for row in main.home_keyboard().inline_keyboard for button in row]
         self.assertEqual([button.callback_data for button in buttons], ["create_new", "create_all"])
+
+    async def test_both_modes_include_21_day_boundary_and_exclude_older_posts(self):
+        edge, expired, recent = item(2), item(3), item(4)
+        edge["created_at_utc"] = (TEST_NOW - timedelta(days=21)).isoformat()
+        expired["created_at_utc"] = (TEST_NOW - timedelta(days=21, seconds=1)).isoformat()
+        with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[edge, expired, recent])):
+            for mode in ("all", "new"):
+                with self.subTest(mode=mode):
+                    rows, _, _ = await main.get_live_properties(mode)
+                    self.assertEqual({row["message_id"] for row in rows}, {2, 4})
+
+    async def test_old_posts_are_excluded_before_item_limit(self):
+        expired, recent = item(2), item(3)
+        expired["created_at_utc"] = (TEST_NOW - timedelta(days=22)).isoformat()
+        with patch.object(main, "MAX_ITEMS", 1), patch.object(
+            main, "fetch_live_channel_objects", new=AsyncMock(return_value=[expired, recent])
+        ):
+            rows, hidden, _ = await main.get_live_properties("all")
+        self.assertEqual([row["message_id"] for row in rows], [3])
+        self.assertEqual(hidden, 0)
+
+    async def test_old_fallback_posts_are_not_verified_or_included(self):
+        main.upsert_property_post("irelandrent", -1001, 2, LISTING, TEST_NOW - timedelta(days=22))
+        main.upsert_property_post("irelandrent", -1001, 3, LISTING.replace("1234", "1235"), TEST_NOW - timedelta(days=3))
+        with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(side_effect=main.LiveChannelReadError("blocked"))), \
+             patch.object(main, "check_source_post", new=AsyncMock(return_value=True)) as check:
+            rows, _, _ = await main.get_live_properties("all")
+        self.assertEqual([row["message_id"] for row in rows], [3])
+        self.assertEqual(check.await_count, 1)
+
+    def test_source_edit_does_not_renew_original_post_date(self):
+        original_date = TEST_NOW - timedelta(days=22)
+        main.upsert_property_post("irelandrent", -1001, 2, LISTING, original_date)
+        main.upsert_property_post("irelandrent", -1001, 2, LISTING + "\nНові деталі", original_date)
+        rows, _ = main.get_uncollected_properties(apply_limit=False)
+        self.assertEqual(rows, [])
+        with main.db() as conn:
+            row = conn.execute("SELECT created_at_utc, updated_at_utc FROM property_posts").fetchone()
+        self.assertEqual(row["created_at_utc"], original_date.isoformat())
+        self.assertEqual(row["updated_at_utc"], TEST_NOW.isoformat())
+
+    async def test_publish_rejects_preview_that_has_aged_past_three_weeks(self):
+        expired = item(2)
+        expired["created_at_utc"] = (TEST_NOW - timedelta(days=21, seconds=1)).isoformat()
+        main.PREVIEWS[123] = {"mode": "all", "properties": [expired], "text": "preview"}
+        update = query_update()
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+        await main.publish_to(update, context, ["@main"])
+        context.bot.send_message.assert_not_awaited()
+        self.assertIn("3 тижні", update.callback_query.message.reply_text.await_args.args[0])
+
+    def test_recent_filter_compares_utc_offsets_and_rejects_invalid_dates(self):
+        boundary, expired, invalid = item(2), item(3), item(4)
+        boundary["created_at_utc"] = "2026-09-28T11:00:00+01:00"
+        expired["created_at_utc"] = "2026-09-28T10:59:59+01:00"
+        invalid["created_at_utc"] = "bad date"
+        rows = main.filter_recent_properties([boundary, expired, invalid], now_utc=TEST_NOW)
+        self.assertEqual([row["message_id"] for row in rows], [2])
 
 
 class TestAvailabilityAndPagination(unittest.IsolatedAsyncioTestCase):

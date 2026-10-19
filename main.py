@@ -48,6 +48,7 @@ SOURCE_CHANNELS = {
 }
 
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Dublin"))
+COLLECTION_LOOKBACK_DAYS = 21
 MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "25"))
 VERIFY_SOURCE_POSTS = os.environ.get("VERIFY_SOURCE_POSTS", "true").strip().lower() not in {
     "0", "false", "no", "off"
@@ -62,7 +63,7 @@ LIVE_SOURCE_MAX_PAGES = max(1, int(os.environ.get("LIVE_SOURCE_MAX_PAGES", "200"
 LIVE_SOURCE_TIMEOUT = float(os.environ.get("LIVE_SOURCE_TIMEOUT", "8"))
 LIVE_SOURCE_RETRIES = max(1, int(os.environ.get("LIVE_SOURCE_RETRIES", "3")))
 LIVE_SOURCE_RETRY_DELAY = max(0.0, float(os.environ.get("LIVE_SOURCE_RETRY_DELAY", "0.8")))
-SOURCE_SYNC_LOOKBACK_HOURS = max(1, int(os.environ.get("SOURCE_SYNC_LOOKBACK_HOURS", "72")))
+SOURCE_SYNC_LOOKBACK_HOURS = max(1, int(os.environ.get("SOURCE_SYNC_LOOKBACK_HOURS", str(COLLECTION_LOOKBACK_DAYS * 24))))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -960,7 +961,7 @@ def get_today_properties(apply_limit=True):
 
 
 def get_uncollected_properties(apply_limit=True):
-    """Return unused posts of any age; previews and limits do not consume posts."""
+    """Return unused posts from the last 21 days; drafts do not consume posts."""
     with db() as conn:
         rows = conn.execute(
             """
@@ -970,9 +971,26 @@ def get_uncollected_properties(apply_limit=True):
             """,
         ).fetchall()
 
-    properties = exclude_collected_properties(_deduplicate_and_sort(rows))
+    properties = exclude_collected_properties(filter_recent_properties(_deduplicate_and_sort(rows)))
     properties = [item for item in properties if not is_inactive_property_post(item["raw_text"])]
     return _with_limit(properties, apply_limit)
+
+
+def filter_recent_properties(properties, *, now_utc=None):
+    """Use the original source-post date, including the exact 21-day boundary."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    cutoff_utc = now_utc - timedelta(days=COLLECTION_LOOKBACK_DAYS)
+    result = []
+    for item in properties:
+        try:
+            posted_at = datetime.fromisoformat(str(item["created_at_utc"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if posted_at.tzinfo is None:
+            posted_at = posted_at.replace(tzinfo=timezone.utc)
+        if cutoff_utc <= posted_at.astimezone(timezone.utc) <= now_utc:
+            result.append(item)
+    return result
 
 
 def exclude_collected_properties(properties):
@@ -1393,14 +1411,15 @@ async def get_live_properties(mode: str):
         raise ValueError(f"Unknown collection mode: {mode}")
 
     now_local = datetime.now(TZ)
+    now_utc = now_local.astimezone(timezone.utc)
     today = now_local.date().isoformat()
     if mode == "today":
         local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
         threshold_utc = local_midnight.astimezone(timezone.utc)
     else:
-        # Both user-facing modes cover all ages. Freshness is tracked by the
-        # actual published items, never by the time of the last collection.
-        threshold_utc = None
+        # Both modes cover the same rolling 21-day window. Freshness is tracked
+        # separately by actual published items, never by the last collection date.
+        threshold_utc = now_utc - timedelta(days=COLLECTION_LOOKBACK_DAYS)
 
     async def read_one_source(username):
         direct_error = None
@@ -1454,6 +1473,7 @@ async def get_live_properties(mode: str):
         raise LiveChannelReadError(details)
 
     candidates = [item for batch in results for item in batch]
+    candidates = filter_recent_properties(candidates, now_utc=now_utc)
     if mode == "today":
         candidates = [item for item in candidates if item.get("local_date") == today]
 
@@ -1831,8 +1851,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Housely Collections Bot\n\n"
         "Бот читає об'єкти з @dublin_rent та @irelandrent, "
         "прибирає дублікати й пропускає пости з позначкою недоступності.\n\n"
-        "🆕 Тільки свіжі пости - вільні об'єкти, яких ще не було в опублікованих підбірках.\n"
-        "🏡 Усі вільні - усі доступні об'єкти незалежно від дати та попередніх підбірок.\n\n"
+        "🆕 Тільки свіжі пости - вільні об'єкти за останні 3 тижні, яких ще не було в опублікованих підбірках.\n"
+        "🏡 Усі вільні - усі доступні об'єкти за останні 3 тижні незалежно від попередніх підбірок.\n\n"
         "Якщо публічна сторінка Telegram "
         "тимчасово не віддає історію, бот використовує власне дзеркало постів каналів.",
         reply_markup=home_keyboard(),
@@ -1869,14 +1889,14 @@ async def create_collection_preview(update: Update, mode: str):
     if not properties:
         if mode == "new":
             empty_text = (
-                "Свіжих вільних постів, яких ще не було в опублікованих "
+                "Свіжих вільних постів за останні 3 тижні, яких ще не було в опублікованих "
                 "підбірках, поки немає.\n\n"
                 "Preview, редагування, Regenerate або Cancel не змінюють "
                 "історію використаних постів."
             )
         else:
             empty_text = (
-                "У вихідних каналах немає вільних об'єктів для підбірки."
+                "У вихідних каналах немає вільних об'єктів за останні 3 тижні для підбірки."
             )
         await q.message.reply_text(
             empty_text,
@@ -1943,9 +1963,9 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not properties:
         empty_text = (
-            "Нових невикористаних об'єктів немає."
+            "Нових невикористаних об'єктів за останні 3 тижні немає."
             if mode == "new"
-            else "Немає вільних об'єктів для підбірки."
+            else "Немає вільних об'єктів за останні 3 тижні для підбірки."
         )
         await q.edit_message_text(empty_text, reply_markup=home_keyboard())
         return
@@ -2077,6 +2097,13 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
     await q.answer("Публікую…")
     text = preview["text"]
     properties = preview.get("properties", [])
+    if len(filter_recent_properties(properties)) != len(properties):
+        await q.message.reply_text(
+            "⚠️ Частина постів уже старша за 3 тижні. "
+            "Натисніть Regenerate, щоб оновити підбірку.",
+            reply_markup=preview_keyboard(),
+        )
+        return
     unused = exclude_collected_properties(properties) if preview.get("mode") == "new" else properties
     if len(unused) != len(properties):
         await q.message.reply_text(
