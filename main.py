@@ -58,7 +58,7 @@ SOURCE_SYNC_ENABLED = os.environ.get("SOURCE_SYNC_ENABLED", "true").strip().lowe
     "0", "false", "no", "off"
 }
 SOURCE_SYNC_TIMEOUT = float(os.environ.get("SOURCE_SYNC_TIMEOUT", "6"))
-LIVE_SOURCE_MAX_PAGES = max(1, int(os.environ.get("LIVE_SOURCE_MAX_PAGES", "20")))
+LIVE_SOURCE_MAX_PAGES = max(1, int(os.environ.get("LIVE_SOURCE_MAX_PAGES", "200")))
 LIVE_SOURCE_TIMEOUT = float(os.environ.get("LIVE_SOURCE_TIMEOUT", "8"))
 LIVE_SOURCE_RETRIES = max(1, int(os.environ.get("LIVE_SOURCE_RETRIES", "3")))
 LIVE_SOURCE_RETRY_DELAY = max(0.0, float(os.environ.get("LIVE_SOURCE_RETRY_DELAY", "0.8")))
@@ -570,17 +570,25 @@ def is_inactive_property_post(text: str) -> bool:
     lines = [clean_line(raw) for raw in (text or "").splitlines() if clean_line(raw)]
     if not lines:
         return False
-    # Owners usually prepend one short status line and leave the old listing below it.
+    # The team's marker is "🔴 БІЛЬШЕ НЕ ДОСТУПНО 🔴" (often bold).
+    # A status can be added anywhere while the original advert remains intact.
+    # Strip leading status icons independently of the listing-title icon set.
+    lines = [re.sub(r"^[\W_]+", "", line).casefold() for line in lines]
+    status_prefix = (
+        r"^(?:(?:на жаль|к сожалению)[,!: ]+)?"
+        r"(?:(?:цей|даний|этот|данный|this)\s+)?"
+        r"(?:(?:об['’]єкт|объект|житло|жиль[её]|кімната|комната|квартира|"
+        r"будинок|дом|пропозиція|предложение|listing|property|room)\s*[:\-]?\s+)?"
+        r"(?:(?:вже|уже|більше|больше|наразі|зараз|сейчас|теперь)\s+)?"
+    )
     inactive_patterns = (
-        r"^(?:не\s*доступн|недоступн)",
-        r"^(?:вже|уже)\s+недоступн",
-        r"^(?:неактуальн|не\s+актуальн)",
-        r"^(?:здано|сдано)(?:\b|[.!])",
+        status_prefix + r"(?:не\s*доступн|не\s*актуальн)",
+        status_prefix + r"(?:здано|сдано)(?:\b|[.!])",
         r"^(?:already\s+unavailable|no\s+longer\s+available|rented)(?:\b|[.!])",
     )
     return any(
         re.search(pattern, line.lower(), re.IGNORECASE)
-        for line in lines[:3]
+        for line in lines
         for pattern in inactive_patterns
     )
 
@@ -600,6 +608,9 @@ def looks_like_property_post(text: str) -> bool:
         "підбірка за сьогодні",
         "тільки нові об'єкти",
         "тільки нові об’єкти",
+        "усі вільні об'єкти",
+        "усі вільні об’єкти",
+        "підбірку вільного житла",
     )
     if any(marker in low for marker in collection_markers):
         return False
@@ -765,12 +776,16 @@ def _parse_channel_page_messages(username: str, page_html: str):
 
         text_node = post.select_one(".tgme_widget_message_text, .tgme_widget_message_caption")
         time_node = post.select_one("time[datetime]")
-        if text_node is None or time_node is None:
+        if time_node is None:
             continue
 
-        for br in text_node.find_all("br"):
-            br.replace_with("\n")
-        text = text_node.get_text("", strip=False).strip()
+        # Media-only posts still count for pagination, even though they cannot
+        # become property rows on their own.
+        text = ""
+        if text_node is not None:
+            for br in text_node.find_all("br"):
+                br.replace_with("\n")
+            text = text_node.get_text("", strip=False).strip()
         try:
             message_date = datetime.fromisoformat(time_node["datetime"].replace("Z", "+00:00"))
         except (KeyError, TypeError, ValueError):
@@ -945,32 +960,42 @@ def get_today_properties(apply_limit=True):
 
 
 def get_uncollected_properties(apply_limit=True):
-    """Return every post published after the last successful collection."""
+    """Return unused posts of any age; previews and limits do not consume posts."""
     with db() as conn:
-        last_publication = conn.execute(
-            """
-            SELECT MAX(cp.created_at_utc) AS created_at_utc
-            FROM collection_publications AS cp
-            WHERE cp.deleted_at_utc IS NULL
-              AND EXISTS (
-                  SELECT 1
-                  FROM collection_publication_messages AS cpm
-                  WHERE cpm.publication_id = cp.id
-                    AND cpm.deleted_at_utc IS NULL
-              )
-            """
-        ).fetchone()["created_at_utc"]
         rows = conn.execute(
             """
             SELECT *
             FROM property_posts
-            WHERE ? IS NULL OR created_at_utc > ?
             ORDER BY created_at_utc DESC
             """,
-            (last_publication, last_publication),
         ).fetchall()
 
-    return _with_limit(_deduplicate_and_sort(rows), apply_limit)
+    properties = exclude_collected_properties(_deduplicate_and_sort(rows))
+    properties = [item for item in properties if not is_inactive_property_post(item["raw_text"])]
+    return _with_limit(properties, apply_limit)
+
+
+def exclude_collected_properties(properties):
+    """Exclude posts used in any successfully published, non-cancelled collection."""
+    with db() as conn:
+        used = conn.execute(
+            """
+            SELECT cpi.ref, cpi.post_url
+            FROM collection_publication_items AS cpi
+            JOIN collection_publications AS cp ON cp.id = cpi.publication_id
+            WHERE cp.deleted_at_utc IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM collection_publication_messages AS cpm
+                  WHERE cpm.publication_id = cp.id AND cpm.deleted_at_utc IS NULL
+              )
+            """
+        ).fetchall()
+    used_refs = {row["ref"] for row in used}
+    used_urls = {row["post_url"] for row in used}
+    return [
+        item for item in properties
+        if item.get("ref") not in used_refs and item.get("post_url") not in used_urls
+    ]
 
 
 def record_publication(admin_user_id: int, mode: str, text_html: str, properties, messages):
@@ -1066,7 +1091,7 @@ def finish_publication_undo(publication_id: int):
     return active_count == 0
 
 
-def classify_post_check_response(status_code: int, response_text: str):
+def classify_post_check_response(status_code: int, response_text: str, *, require_text=False):
     """Return True for an existing post, False for a missing post, None if uncertain."""
     if status_code in (404, 410):
         return False
@@ -1083,6 +1108,18 @@ def classify_post_check_response(status_code: int, response_text: str):
     if any(marker in body for marker in missing_markers):
         return False
 
+    soup = BeautifulSoup(response_text or "", "html.parser")
+    readable_text = False
+    for node in soup.select(".tgme_widget_message_text, .tgme_widget_message_caption"):
+        for br in node.find_all("br"):
+            br.replace_with("\n")
+        text = node.get_text("", strip=False)
+        readable_text = readable_text or bool(text.strip())
+        if is_inactive_property_post(text):
+            return False
+    if require_text and not readable_text:
+        return None
+
     existing_markers = (
         "tgme_widget_message_bubble",
         "data-post=",
@@ -1097,7 +1134,7 @@ def classify_post_check_response(status_code: int, response_text: str):
     return None
 
 
-async def check_source_post(item, client: httpx.AsyncClient, semaphore: asyncio.Semaphore):
+async def check_source_post(item, client: httpx.AsyncClient, semaphore: asyncio.Semaphore, *, require_text=False):
     url = item["post_url"]
     separator = "&" if "?" in url else "?"
     check_url = f"{url}{separator}embed=1&mode=tme"
@@ -1109,7 +1146,7 @@ async def check_source_post(item, client: httpx.AsyncClient, semaphore: asyncio.
             log.warning("Could not verify %s: %s", url, exc)
             return None
 
-    return classify_post_check_response(response.status_code, response.text)
+    return classify_post_check_response(response.status_code, response.text, require_text=require_text)
 
 
 def delete_property_posts(items):
@@ -1122,9 +1159,9 @@ def delete_property_posts(items):
         conn.execute(f"DELETE FROM property_posts WHERE id IN ({placeholders})", ids)
 
 
-async def remove_missing_source_posts(properties):
-    """Live-check public Telegram links and remove definitively missing posts."""
-    if not VERIFY_SOURCE_POSTS or not properties:
+async def remove_missing_source_posts(properties, *, require_confirmed=False):
+    """Remove missing/closed posts; strict checks reject uncertain availability."""
+    if not properties or (not VERIFY_SOURCE_POSTS and not require_confirmed):
         return properties, []
 
     timeout = httpx.Timeout(POST_CHECK_TIMEOUT)
@@ -1133,7 +1170,11 @@ async def remove_missing_source_posts(properties):
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
         states = await asyncio.gather(
-            *(check_source_post(item, client, semaphore) for item in properties)
+            *(
+                check_source_post(item, client, semaphore, require_text=True)
+                if require_confirmed else check_source_post(item, client, semaphore)
+                for item in properties
+            )
         )
 
     missing = [item for item, state in zip(properties, states) if state is False]
@@ -1146,6 +1187,9 @@ async def remove_missing_source_posts(properties):
             len(missing),
             [item["post_url"] for item in missing],
         )
+
+    if require_confirmed and any(state is None for state in states):
+        raise LiveChannelReadError("Could not confirm current source-post availability")
 
     return remaining, missing
 
@@ -1221,6 +1265,8 @@ def get_cached_channel_objects(username: str, threshold_utc: datetime | None = N
     result = []
     for row in rows:
         item = dict(row)
+        if is_inactive_property_post(item.get("raw_text", "")):
+            continue
         raw_ref = str(item.get("ref") or "")
         item["real_ref"] = None if raw_ref.startswith("post:") else (raw_ref or None)
         result.append(item)
@@ -1296,9 +1342,8 @@ async def fetch_live_channel_objects(username: str, threshold_utc: datetime | No
             )
             if not page_messages:
                 if (
-                    threshold_utc is not None
-                    and previous_oldest_date is not None
-                    and previous_oldest_date > threshold_utc
+                    threshold_utc is None
+                    or (previous_oldest_date is not None and previous_oldest_date > threshold_utc)
                 ):
                     raise LiveChannelReadError(
                         f"@{username}: public-history pagination stopped before the requested time window"
@@ -1311,7 +1356,7 @@ async def fetch_live_channel_objects(username: str, threshold_utc: datetime | No
                 if post["message_id"] not in seen_message_ids
             ]
             if not new_page_ids:
-                break
+                raise LiveChannelReadError(f"@{username}: public-history pagination did not advance")
             seen_message_ids.update(new_page_ids)
 
             live_items = parse_live_channel_page(username, response.text)
@@ -1324,15 +1369,27 @@ async def fetch_live_channel_objects(username: str, threshold_utc: datetime | No
 
             if threshold_utc is not None and oldest_date <= threshold_utc:
                 break
-            if before is not None and earliest_id >= before:
+            # Telegram omits the older-history link on the first-ever page.
+            soup = BeautifulSoup(response.text, "html.parser")
+            history = soup.select_one(".tgme_channel_history")
+            if earliest_id <= 1 or (
+                history is not None
+                and soup.select_one(".tme_messages_more") is None
+            ):
                 break
+            if before is not None and earliest_id >= before:
+                raise LiveChannelReadError(f"@{username}: public-history pagination did not advance")
             before = earliest_id
+        else:
+            raise LiveChannelReadError(
+                f"@{username}: LIVE_SOURCE_MAX_PAGES={LIVE_SOURCE_MAX_PAGES} reached before history was complete"
+            )
 
     return result
 
 
 async def get_live_properties(mode: str):
-    if mode not in {"today", "new"}:
+    if mode not in {"all", "today", "new"}:
         raise ValueError(f"Unknown collection mode: {mode}")
 
     now_local = datetime.now(TZ)
@@ -1341,10 +1398,9 @@ async def get_live_properties(mode: str):
         local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
         threshold_utc = local_midnight.astimezone(timezone.utc)
     else:
-        threshold_utc = get_last_successful_publication_utc()
-        if threshold_utc is None:
-            local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
-            threshold_utc = local_midnight.astimezone(timezone.utc)
+        # Both user-facing modes cover all ages. Freshness is tracked by the
+        # actual published items, never by the time of the last collection.
+        threshold_utc = None
 
     async def read_one_source(username):
         direct_error = None
@@ -1373,6 +1429,10 @@ async def get_live_properties(mode: str):
         # mirror created from real channel_post updates / startup sync.
         cached = get_cached_channel_objects(username, threshold_utc)
         if cached:
+            if mode == "new":
+                cached = exclude_collected_properties(cached)
+            if mode in {"all", "new"}:
+                cached, _ = await remove_missing_source_posts(cached, require_confirmed=True)
             log.warning(
                 "Public history for @%s is unreadable; using %s cached channel post(s)",
                 username, len(cached),
@@ -1396,13 +1456,10 @@ async def get_live_properties(mode: str):
     candidates = [item for batch in results for item in batch]
     if mode == "today":
         candidates = [item for item in candidates if item.get("local_date") == today]
-    elif threshold_utc is not None:
-        candidates = [
-            item
-            for item in candidates
-            if datetime.fromisoformat(item["created_at_utc"].replace("Z", "+00:00"))
-            .astimezone(timezone.utc) > threshold_utc
-        ]
+
+    candidates = [item for item in candidates if not is_inactive_property_post(item.get("raw_text", ""))]
+    if mode == "new":
+        candidates = exclude_collected_properties(candidates)
 
     properties = deduplicate_live_objects(candidates)
     hidden_count = max(0, len(properties) - MAX_ITEMS)
@@ -1460,14 +1517,14 @@ def ensure_collection_footer(text: str) -> str:
 
 def build_collection_intro(mode: str) -> str:
     """Shared Housely greeting/contacts; only the headline changes by mode."""
-    title = (
-        "🆕 <b>Нові пропозиції житла вже тут!</b>"
-        if mode == "new"
-        else "🏡 <b>Всім привіт! Зібрали для вас підбірку новинок за сьогодні!</b>"
-    )
+    title = {
+        "new": "🆕 <b>Нові пропозиції житла вже тут!</b>",
+        "all": "🏡 <b>Всім привіт! Зібрали для вас підбірку вільного житла!</b>",
+    }.get(mode, "🏡 <b>Всім привіт! Зібрали для вас підбірку новинок за сьогодні!</b>")
+    prompt = "Переглядайте вільні пропозиції житла нижче 👇" if mode == "all" else "Переглядайте нові пропозиції житла нижче 👇"
     return (
         f"{title}\n\n"
-        "Переглядайте нові пропозиції житла нижче 👇\n\n"
+        f"{prompt}\n\n"
         "🔑 Сподобався варіант? Не відкладайте - зв'яжіться з нами, "
         "щоб дізнатися деталі та домовитися про перегляд.\n\n"
         "📩 <b>Контакти для зв'язку:</b>\n\n"
@@ -1492,7 +1549,7 @@ def restore_collection_contact_links(edited_html: str) -> str:
     )
 
 
-def build_collection(properties, hidden_count=0, mode="today"):
+def build_collection(properties, hidden_count=0, mode="all"):
     parts = [build_collection_intro(mode), ""]
 
     by_type = {}
@@ -1663,6 +1720,7 @@ def restore_standard_collection_formatting(edited_html: str, properties):
             or "нові актуальні пропозиції" in low
             or "зібрали для вас підбірку новинок за сьогодні" in low
             or "нові пропозиції житла вже тут" in low
+            or "зібрали для вас підбірку вільного житла" in low
         ):
             restored_lines.append(_bold_whole_label(visible))
             continue
@@ -1709,8 +1767,8 @@ def is_admin(user_id: int) -> bool:
 
 def home_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Підбірка за сьогодні", callback_data="create_today")],
-        [InlineKeyboardButton("🆕 Тільки нові об'єкти", callback_data="create_new")],
+        [InlineKeyboardButton("🆕 Тільки свіжі пости", callback_data="create_new")],
+        [InlineKeyboardButton("🏡 Усі вільні", callback_data="create_all")],
     ])
 
 
@@ -1772,8 +1830,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Housely Collections Bot\n\n"
         "Бот читає об'єкти з @dublin_rent та @irelandrent, "
-        "прибирає дублікати й формує підбірки за сьогодні або тільки з об'єктів, "
-        "опублікованих після останньої успішної підбірки. Якщо публічна сторінка Telegram "
+        "прибирає дублікати й пропускає пости з позначкою недоступності.\n\n"
+        "🆕 Тільки свіжі пости - вільні об'єкти, яких ще не було в опублікованих підбірках.\n"
+        "🏡 Усі вільні - усі доступні об'єкти незалежно від дати та попередніх підбірок.\n\n"
+        "Якщо публічна сторінка Telegram "
         "тимчасово не віддає історію, бот використовує власне дзеркало постів каналів.",
         reply_markup=home_keyboard(),
     )
@@ -1809,14 +1869,14 @@ async def create_collection_preview(update: Update, mode: str):
     if not properties:
         if mode == "new":
             empty_text = (
-                "Нових об'єктів після останньої успішно опублікованої "
-                "підбірки поки немає.\n\n"
+                "Свіжих вільних постів, яких ще не було в опублікованих "
+                "підбірках, поки немає.\n\n"
                 "Preview, редагування, Regenerate або Cancel не змінюють "
-                "момент останньої публікації."
+                "історію використаних постів."
             )
         else:
             empty_text = (
-                "Сьогодні у вихідних каналах немає об'єктів для підбірки."
+                "У вихідних каналах немає вільних об'єктів для підбірки."
             )
         await q.message.reply_text(
             empty_text,
@@ -1848,7 +1908,12 @@ async def create_collection_preview(update: Update, mode: str):
 
 
 async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await create_collection_preview(update, "today")
+    # Old inline buttons remain valid after an update.
+    await create_collection_preview(update, "all")
+
+
+async def create_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_collection_preview(update, "all")
 
 
 async def create_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1864,7 +1929,7 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.answer("Оновлено")
     preview = PREVIEWS.get(user.id, {})
-    mode = preview.get("mode", "today")
+    mode = preview.get("mode", "all")
     try:
         properties, hidden_count, missing = await get_verified_properties(mode)
     except LiveChannelReadError as exc:
@@ -1880,7 +1945,7 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         empty_text = (
             "Нових невикористаних об'єктів немає."
             if mode == "new"
-            else "Сьогодні немає об'єктів для підбірки."
+            else "Немає вільних об'єктів для підбірки."
         )
         await q.edit_message_text(empty_text, reply_markup=home_keyboard())
         return
@@ -2011,6 +2076,31 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
 
     await q.answer("Публікую…")
     text = preview["text"]
+    properties = preview.get("properties", [])
+    unused = exclude_collected_properties(properties) if preview.get("mode") == "new" else properties
+    if len(unused) != len(properties):
+        await q.message.reply_text(
+            "⚠️ Частина цих постів уже потрапила в іншу підбірку. "
+            "Натисніть Regenerate, щоб оновити список свіжих постів.",
+            reply_markup=preview_keyboard(),
+        )
+        return
+    try:
+        _, inactive = await remove_missing_source_posts(properties, require_confirmed=True)
+    except LiveChannelReadError:
+        await q.message.reply_text(
+            "⚠️ Не вдалося перевірити, чи всі об'єкти ще вільні. "
+            "Спробуйте опублікувати ще раз через кілька секунд.",
+            reply_markup=preview_keyboard(),
+        )
+        return
+    if inactive:
+        await q.message.reply_text(
+            "⚠️ Частина об'єктів уже недоступна або їхні пости видалено. "
+            "Натисніть Regenerate, щоб створити актуальну підбірку.",
+            reply_markup=preview_keyboard(),
+        )
+        return
     sent_to = []
     sent_messages = []
     errors = []
@@ -2038,7 +2128,7 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
         try:
             publication_id = record_publication(
                 user.id,
-                preview.get("mode", "today"),
+                preview.get("mode", "all"),
                 text,
                 preview.get("properties", []),
                 sent_messages,
@@ -2050,6 +2140,10 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
     result = "✅ Опубліковано:\n" + "\n".join(sent_to) if sent_to else "❌ Не вдалося опублікувати."
     if errors:
         result += "\n\nПомилки:\n" + "\n".join(errors)
+
+    if sent_messages and publication_id:
+        PREVIEWS.pop(user.id, None)
+        EDIT_WAITING.discard(user.id)
 
     await q.message.reply_text(
         result,
@@ -2153,7 +2247,8 @@ async def undo_publication(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if fully_deleted:
         await q.edit_message_text(
             "↩️ Публікацію скасовано та видалено з усіх каналів.\n\n"
-            "Її об'єкти знову доступні для підбірки «Тільки нові об'єкти».",
+            "Її вільні об'єкти знову доступні для підбірки «Тільки свіжі пости», "
+            "якщо їх немає в інших опублікованих підбірках.",
             reply_markup=home_keyboard(),
         )
         return
@@ -2251,6 +2346,7 @@ def main():
 
     # Admin UI.
     app.add_handler(CallbackQueryHandler(create_today, pattern=r"^create_today$"))
+    app.add_handler(CallbackQueryHandler(create_all, pattern=r"^create_all$"))
     app.add_handler(CallbackQueryHandler(create_new, pattern=r"^create_new$"))
     app.add_handler(CallbackQueryHandler(regenerate, pattern=r"^regenerate$"))
     app.add_handler(CallbackQueryHandler(edit_preview, pattern=r"^edit_preview$"))

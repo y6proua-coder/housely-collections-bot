@@ -547,7 +547,7 @@ class TestDatabaseCleanup(unittest.TestCase):
             {first["post_url"], second["post_url"]},
         )
 
-    def test_post_before_last_publication_is_not_new_even_if_omitted(self):
+    def test_post_omitted_from_last_publication_stays_fresh(self):
         omitted = property_item(1)
         published = property_item(2)
         self.insert_item(omitted)
@@ -561,7 +561,7 @@ class TestDatabaseCleanup(unittest.TestCase):
         )
 
         remaining, _ = main.get_uncollected_properties(apply_limit=False)
-        self.assertEqual(remaining, [])
+        self.assertEqual([row["ref"] for row in remaining], [omitted["ref"]])
 
     def test_undo_makes_items_new_again(self):
         item = property_item(1)

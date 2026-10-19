@@ -1,5 +1,28 @@
 # Housely Collections Bot
 
+## v0.8.0 - fresh posts or all available listings
+
+The main menu now has exactly two options:
+
+- `🆕 Тільки свіжі пости`: available source posts that have not appeared in a successfully published, non-cancelled collection. A post can be older than today or the last collection. Existing publication history is reused, including posts published through the old Today mode or the new All mode. Identity is checked by Ref and Telegram post URL; a repost with an already used Ref is not fresh.
+- `🏡 Усі вільні`: available posts of any age, including posts used in earlier collections. This replaces the Today button. Older Today buttons also open All.
+
+Both modes scan source history without a date cutoff, ignore duplicate listings and reject posts marked unavailable even when the original advert remains in the channel. The team's exact marker `🔴 БІЛЬШЕ НЕ ДОСТУПНО 🔴` is recognized, including bold formatting, different letter case and repeated spaces. It may appear at the top, in the middle or at the end of the post or photo caption. Other supported status lines include `Більше недоступно`, `Больше не доступно`, `Об'єкт більше недоступний`, `Не доступно`, `Здано`, `Сдано` and `No longer available`. An amenity detail such as `Інтернет недоступний` does not close the listing.
+
+Freshness is recorded only after Telegram accepts publication to at least one destination. Preview, Edit, Regenerate, Cancel, hidden items and lines removed from a preview do not consume listings. Undo restores eligibility only when the post is no longer used by another active collection. Once a collection is published and recorded, its preview is cleared to prevent accidental repeated publication.
+
+Before publication the bot checks the current source-post text again. If a listing has become unavailable, been deleted, or been used in another collection while a Fresh preview was open, publication stops and the admin is asked to regenerate. If current availability cannot be read, publication stops for a retry.
+
+Direct public channel history remains the primary source. Cached fallback listings are checked against their current Telegram captions before use in either mode, even if the legacy `VERIFY_SOURCE_POSTS` switch is disabled. Unreadable current captions cause a source error instead of being assumed available. The cache may cover only posts the bot previously received or synced; if a public-history read fails, it cannot recover older posts absent from that cache.
+
+Pagination counts media-only posts, detects a stalled scan and refuses a silently truncated direct scan. `LIVE_SOURCE_MAX_PAGES` now defaults to `200`. Update an explicitly configured value of `20` to `200` if the complete source history needs more pages. Reading all history can take longer than the previous Today mode.
+
+The existing `MAX_ITEMS=25` and Telegram message-size limit still apply to each collection. Additional matches are shown as a hidden count. Hidden posts remain eligible for the next Fresh collection; All always considers the full available set again.
+
+Keep the existing `/app/data/collections.db` and persistent volume. No reset, new token or new database is required. This archive updates code only; deploying it is a separate step.
+
+Validation: `python -m pytest -q` (install requirements and pytest first). Tests cover both modes, old unused posts, existing publication history, hidden items, Undo, status edits, cache checks, publication-time checks and complete-history pagination.
+
 ## v0.7.3 — updated collection message templates
 
 Both collection modes now use the approved Ukrainian intro, with different headlines:
@@ -77,7 +100,7 @@ Required:
 
 Recommended source settings (defaults already match these values):
 
-- `LIVE_SOURCE_MAX_PAGES=20`
+- `LIVE_SOURCE_MAX_PAGES=200`
 - `LIVE_SOURCE_TIMEOUT=8`
 - `LIVE_SOURCE_RETRIES=3`
 - `LIVE_SOURCE_RETRY_DELAY=0.8`
