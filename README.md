@@ -1,5 +1,19 @@
 # Housely Collections Bot
 
+## v0.8.3 - recover the previously published links and remove overflow notices
+
+Fresh and All use the same source-post age window (the last 21 days) and both exclude posts marked `🔴 БІЛЬШЕ НЕ ДОСТУПНО 🔴`. All includes eligible posts even if they appeared in earlier collections. Fresh excludes links and known Refs used by earlier, non-cancelled published collections.
+
+Connecting a persistent volume preserves future history, but does not recreate history that was lost before the volume existed. Before generating Fresh, this release also reads actual published collections in `MAIN_CHANNEL`, `DUBLIN_CHANNEL` and `IRELAND_CHANNEL` for the last 21 days. It restores their source-post hyperlinks to a separate SQLite history table and uses those links for exclusion. Recognizable collections copied into a channel manually are supported too, provided their source-post links remain intact. Channel updates observe newly published collections immediately; public-history checks are reused for at most 60 seconds. Drafts and private previews are never imported as published collections.
+
+The recovery reader preserves hyperlink targets from Telegram HTML instead of seeing only the visible `Детальніше` labels. Collection headings plus links to configured property source channels identify a collection. Ordinary property adverts, contacts and unrelated channels are not imported. Failed or incomplete channel-history reads stop Fresh with a specific history error; All remains independent of that check. This avoids silently claiming previously used posts are fresh when history is unavailable. A locally undone collection stays cancelled even if the same public page is later read from a cache.
+
+The line `➕ Ще … пропозицій не показано в цій підбірці` has been removed from generated messages in both modes. Edit also removes that old line if pasted back into a new preview. The existing `MAX_ITEMS` and message-length limits remain in effect; this update removes the notice and does not change collection size.
+
+`/source_status` reports locally recorded history and channel-recovered history separately. Its direct/cache source counts now use the same 21-day period as the two collection modes. Keep the volume mounted at `/app/data` and do not delete `collections.db`. On the first Fresh request after upgrade, channel-history recovery can take longer than an ordinary regeneration. This archive contains code; it does not itself deploy to Railway or publish any Telegram messages.
+
+Tests include an empty database, recovery from old channel collections, Fresh/All selection, age and availability filters, duplicate imports, cancellation, persistence after reopening the database, unreadable history and removal of the overflow notice.
+
 ## v0.8.2 - correct preview buttons and publication history diagnostics
 
 Fixed a reproducible bug: after creating a Fresh preview and then an All preview (or the reverse), Publish on the older message used the most recently created preview. All preview, edit, regenerate, cancel and destination buttons now carry the preview's own identity. An outdated button shows an alert instead of acting on another collection. Regenerate without a valid preview no longer silently switches to All. Starting a new preview cancels a pending edit of the previous one.
@@ -29,7 +43,7 @@ Direct public channel history remains the primary source. Cached fallback listin
 
 Pagination counts media-only posts, detects a stalled scan and refuses a silently truncated direct scan. `LIVE_SOURCE_MAX_PAGES` defaults to `200`. Update an explicitly configured value of `20` to `200` if the 21-day source history needs more pages. The default startup mirror lookback is now `SOURCE_SYNC_LOOKBACK_HOURS=504` (21 days); update an explicit old value of `72` to `504` for the same fallback coverage.
 
-The existing `MAX_ITEMS=25` and Telegram message-size limit still apply to each collection. Additional matches are shown as a hidden count. Hidden posts remain eligible for the next Fresh collection; All always considers the full available set again.
+The existing `MAX_ITEMS=25` and Telegram message-size limit still apply to each collection. Additional matches are not mentioned in the published text. Posts omitted by these limits remain eligible for the next Fresh collection; All always considers the full available set again.
 
 Keep the existing `/app/data/collections.db` and persistent volume. No reset, new token or new database is required. This archive updates code only; deploying it is a separate step.
 

@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -75,7 +76,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("housely-collections")
-BOT_VERSION = "0.8.2"
+BOT_VERSION = "0.8.3"
 
 # Temporary preview/editor state. It is okay for this to reset on redeploy in MVP.
 PREVIEWS = {}
@@ -180,6 +181,21 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS published_collection_posts (
+                channel_username TEXT NOT NULL,
+                collection_message_id INTEGER NOT NULL,
+                post_url TEXT NOT NULL,
+                ref TEXT,
+                created_at_utc TEXT NOT NULL,
+                imported_at_utc TEXT NOT NULL,
+                deleted_at_utc TEXT,
+                PRIMARY KEY (channel_username, collection_message_id, post_url)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_published_collection_url ON published_collection_posts(post_url)")
 
         # Reparse saved channel posts once after parser changes. This repairs
         # already stored rows too (for example, a room post previously
@@ -756,13 +772,21 @@ def save_channel_post(update: Update):
     if not msg or not msg.chat:
         return False
 
-    return upsert_property_post(
+    observed = save_published_collection(
+        username=msg.chat.username or "",
+        message_id=msg.message_id,
+        text=msg.text or msg.caption or "",
+        text_html=getattr(msg, "text_html", None) or getattr(msg, "caption_html", None) or "",
+        message_date=msg.date,
+    )
+    saved = upsert_property_post(
         username=msg.chat.username or "",
         channel_id=msg.chat.id,
         message_id=msg.message_id,
         text=msg.text or msg.caption or "",
         message_date=msg.date,
     )
+    return saved or observed
 
 
 def _parse_channel_page_messages(username: str, page_html: str):
@@ -785,6 +809,7 @@ def _parse_channel_page_messages(username: str, page_html: str):
         # Media-only posts still count for pagination, even though they cannot
         # become property rows on their own.
         text = ""
+        text_html = text_node.decode_contents() if text_node is not None else ""
         if text_node is not None:
             for br in text_node.find_all("br"):
                 br.replace_with("\n")
@@ -800,6 +825,7 @@ def _parse_channel_page_messages(username: str, page_html: str):
             "username": username,
             "message_id": int(match.group(2)),
             "text": text,
+            "text_html": text_html,
             "message_date": message_date,
         })
 
@@ -819,11 +845,18 @@ def parse_live_channel_page(username: str, page_html: str):
     """Parse live channel objects directly, including manual posts without Ref."""
     result = []
     for post in _parse_channel_page_messages(username, page_html):
-        parsed = parse_live_property(post["text"], post["username"], post["message_id"])
-        if not parsed:
-            continue
-        message_date_utc = post["message_date"].astimezone(timezone.utc)
-        result.append({
+        item = live_property_from_message(post)
+        if item is not None:
+            result.append(item)
+    return result
+
+
+def live_property_from_message(post):
+    parsed = parse_live_property(post["text"], post["username"], post["message_id"])
+    if not parsed:
+        return None
+    message_date_utc = post["message_date"].astimezone(timezone.utc)
+    return {
             "id": None,
             "channel_username": post["username"],
             "channel_id": None,
@@ -834,8 +867,7 @@ def parse_live_channel_page(username: str, page_html: str):
             "local_date": message_date_utc.astimezone(TZ).date().isoformat(),
             "created_at_utc": message_date_utc.isoformat(),
             "updated_at_utc": message_date_utc.isoformat(),
-        })
-    return result
+    }
 
 
 async def sync_recent_source_posts():
@@ -1010,12 +1042,138 @@ def exclude_collected_properties(properties):
               )
             """
         ).fetchall()
+        observed = conn.execute(
+            "SELECT ref, post_url FROM published_collection_posts WHERE deleted_at_utc IS NULL"
+        ).fetchall()
+        used = list(used) + list(observed)
     used_refs = {row["ref"] for row in used}
     used_urls = {row["post_url"] for row in used}
     return [
         item for item in properties
         if item.get("ref") not in used_refs and item.get("post_url") not in used_urls
     ]
+
+
+def collection_history_channels():
+    return SOURCE_CHANNELS | {MAIN_CHANNEL.lstrip("@").lower()}
+
+
+def listing_urls_from_html(text_html):
+    soup = BeautifulSoup(text_html or "", "html.parser")
+    values = [node.get("href", "") for node in soup.select("a[href]")]
+    values += re.findall(r"https?://(?:t\.me|telegram\.me)/[^\s<>\"]+", soup.get_text(" "))
+    urls = set()
+    for value in values:
+        try:
+            parsed = urlsplit(html.unescape(value))
+        except ValueError:
+            continue
+        match = re.fullmatch(r"/([A-Za-z0-9_]+)/(\d+)/?", parsed.path)
+        if parsed.hostname in {"t.me", "telegram.me"} and match and match[1].lower() in SOURCE_CHANNELS:
+            urls.add(f"https://t.me/{match[1].lower()}/{int(match[2])}")
+    return urls
+
+
+def save_published_collection(username, message_id, text, text_html, message_date, known_refs=None):
+    """Recover used links only from real, recognizable channel collections."""
+    username = username.lstrip("@").lower()
+    if username not in collection_history_channels():
+        return False
+    headlines = (
+        "нові пропозиції житла вже тут", "підбірку вільного житла",
+        "підбірку новинок за сьогодні", "актуальне житло на сьогодні",
+        "нові актуальні пропозиції", "тільки нові об'єкти", "тільки нові об’єкти",
+    )
+    header = "\n".join((text or "").casefold().splitlines()[:3])
+    if not any(headline in header for headline in headlines):
+        return False
+    urls = listing_urls_from_html(text_html or html.escape(text or ""))
+    if not urls:
+        return False
+    known_refs = known_refs or {}
+    now_utc = datetime.now(timezone.utc).isoformat()
+    if message_date.tzinfo is None:
+        message_date = message_date.replace(tzinfo=timezone.utc)
+    with db() as conn:
+        for url in urls:
+            row = conn.execute("SELECT ref FROM property_posts WHERE post_url = ? LIMIT 1", (url,)).fetchone()
+            ref = known_refs.get(url) or (row["ref"] if row else None)
+            # A locally undone collection must never be revived by a cached public page.
+            undone = conn.execute(
+                """SELECT 1 FROM collection_publication_messages
+                   WHERE LOWER(LTRIM(destination, '@')) = ? AND message_id = ?
+                     AND deleted_at_utc IS NOT NULL LIMIT 1""", (username, message_id)
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO published_collection_posts
+                    (channel_username, collection_message_id, post_url, ref, created_at_utc, imported_at_utc, deleted_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_username, collection_message_id, post_url) DO UPDATE SET
+                    ref = COALESCE(excluded.ref, published_collection_posts.ref),
+                    imported_at_utc = excluded.imported_at_utc
+                """,
+                (username, message_id, url, ref, message_date.astimezone(timezone.utc).isoformat(),
+                 now_utc, now_utc if undone else None),
+            )
+    return True
+
+
+def recovered_history_stats():
+    with db() as conn:
+        posts = conn.execute(
+            "SELECT COUNT(DISTINCT post_url) FROM published_collection_posts WHERE deleted_at_utc IS NULL"
+        ).fetchone()[0]
+        publications = conn.execute(
+            """SELECT COUNT(*) FROM (
+                SELECT DISTINCT channel_username, collection_message_id
+                FROM published_collection_posts WHERE deleted_at_utc IS NULL
+            )"""
+        ).fetchone()[0]
+    return {"publications": publications, "posts": posts}
+
+
+async def ensure_publication_history(properties=(), *, force=False):
+    """Backfill published collections after loss of the old local database."""
+    now_utc = datetime.now(timezone.utc)
+    with db() as conn:
+        for item in properties:
+            if item.get("ref"):
+                conn.execute(
+                    "UPDATE published_collection_posts SET ref = ? WHERE post_url = ? AND ref IS NULL",
+                    (item["ref"], item["post_url"]),
+                )
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = 'collection_history_checked_at'").fetchone()
+    if row and not force:
+        try:
+            checked = datetime.fromisoformat(row["value"])
+            if timedelta(0) <= now_utc - checked < timedelta(seconds=60):
+                return
+        except (TypeError, ValueError):
+            pass
+    threshold = now_utc - timedelta(days=COLLECTION_LOOKBACK_DAYS)
+    channels = sorted(collection_history_channels())
+    results = await asyncio.gather(
+        *(fetch_channel_messages(username, threshold) for username in channels),
+        return_exceptions=True,
+    )
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise PublicationHistoryReadError("Could not read published collection history: " + "; ".join(map(str, errors)))
+    known_refs = {item["post_url"]: item.get("ref") for item in properties}
+    for posts in results:
+        for post in posts:
+            posted_at = post["message_date"].astimezone(timezone.utc)
+            if threshold <= posted_at <= now_utc:
+                save_published_collection(
+                    post["username"], post["message_id"], post["text"], post.get("text_html", ""),
+                    post["message_date"], known_refs,
+                )
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO bot_settings (key, value) VALUES ('collection_history_checked_at', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""", (now_utc.isoformat(),)
+        )
 
 
 def publication_history_stats():
@@ -1096,6 +1254,15 @@ def get_active_publication_messages(publication_id: int):
 
 def mark_publication_message_deleted(message_row_id: int):
     with db() as conn:
+        message = conn.execute(
+            "SELECT destination, message_id FROM collection_publication_messages WHERE id = ?", (message_row_id,)
+        ).fetchone()
+        if message:
+            conn.execute(
+                """UPDATE published_collection_posts SET deleted_at_utc = ?
+                   WHERE channel_username = ? AND collection_message_id = ?""",
+                (datetime.now(timezone.utc).isoformat(), message["destination"].lstrip("@").lower(), message["message_id"]),
+            )
         conn.execute(
             """
             UPDATE collection_publication_messages
@@ -1315,6 +1482,10 @@ class LiveChannelReadError(RuntimeError):
     pass
 
 
+class PublicationHistoryReadError(LiveChannelReadError):
+    pass
+
+
 async def _get_public_history_page(client, username: str, url: str, *, first_page: bool):
     """Fetch one Telegram public-history page with retries.
 
@@ -1349,8 +1520,8 @@ async def _get_public_history_page(client, username: str, url: str, *, first_pag
     raise LiveChannelReadError(f"@{username}: could not read public history")
 
 
-async def fetch_live_channel_objects(username: str, threshold_utc: datetime | None = None):
-    """Read public Telegram history page-by-page. No property DB is consulted."""
+async def fetch_channel_messages(username: str, threshold_utc: datetime | None = None):
+    """Read source messages with their original dates and hyperlink targets."""
     username = username.lstrip("@").lower()
     timeout = httpx.Timeout(LIVE_SOURCE_TIMEOUT)
     headers = {
@@ -1397,8 +1568,7 @@ async def fetch_live_channel_objects(username: str, threshold_utc: datetime | No
                 raise LiveChannelReadError(f"@{username}: public-history pagination did not advance")
             seen_message_ids.update(new_page_ids)
 
-            live_items = parse_live_channel_page(username, response.text)
-            result.extend(item for item in live_items if item["message_id"] in new_page_ids)
+            result.extend(post for post in page_messages if post["message_id"] in new_page_ids)
 
             oldest_message = min(page_messages, key=lambda post: post["message_id"])
             oldest_date = oldest_message["message_date"].astimezone(timezone.utc)
@@ -1424,6 +1594,11 @@ async def fetch_live_channel_objects(username: str, threshold_utc: datetime | No
             )
 
     return result
+
+
+async def fetch_live_channel_objects(username: str, threshold_utc: datetime | None = None):
+    messages = await fetch_channel_messages(username, threshold_utc)
+    return [item for post in messages if (item := live_property_from_message(post)) is not None]
 
 
 async def get_live_properties(mode: str):
@@ -1500,6 +1675,7 @@ async def get_live_properties(mode: str):
     candidates = [item for item in candidates if not is_inactive_property_post(item.get("raw_text", ""))]
     available_count = len(candidates)
     if mode == "new":
+        await ensure_publication_history(candidates)
         candidates = exclude_collected_properties(candidates)
     log.info(
         "Collection mode=%s | lookback_days=%s | available=%s | excluded_used=%s | matched=%s",
@@ -1630,9 +1806,6 @@ def build_collection(properties, hidden_count=0, mode="all"):
                 )
             parts.append("")
 
-    if hidden_count:
-        parts.append(f"➕ Ще {hidden_count} пропозицій не показано в цій підбірці.")
-
     parts.extend(["", build_collection_footer()])
 
     text = "\n".join(parts).strip()
@@ -1642,6 +1815,13 @@ def build_collection(properties, hidden_count=0, mode="all"):
         return build_collection(properties[:-1], hidden_count + 1, mode=mode)
 
     return text
+
+
+def remove_overflow_notice(text):
+    return "\n".join(
+        line for line in (text or "").splitlines()
+        if not re.fullmatch(r"(?:➕\s*)?Ще\s+\d+\s+пропозиці[йї].*не\s+показано.*", clean_line(visible_html_text(line)), re.IGNORECASE)
+    )
 
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -1888,6 +2068,20 @@ async def deny(update: Update):
         await update.effective_message.reply_text("У вас немає доступу до цього бота.")
 
 
+def collection_read_error_text(exc):
+    if isinstance(exc, PublicationHistoryReadError):
+        return (
+            "⚠️ Не вдалося перевірити історію опублікованих підбірок у каналах. "
+            "Не можу надійно визначити, які пости свіжі.\n\n"
+            "Спробуйте ще раз або надішліть /source_status. Режим «Усі вільні» доступний окремо."
+        )
+    return (
+        "⚠️ Не вдалося надійно прочитати один із вихідних каналів. "
+        "Я не показую порожню підбірку, щоб випадково не пропустити об'єкти.\n\n"
+        "Спробуйте ще раз через кілька секунд. Якщо повториться — надішліть /source_status."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id):
@@ -1926,9 +2120,7 @@ async def create_collection_preview(update: Update, mode: str):
     except LiveChannelReadError as exc:
         log.warning("Live channel read failed while creating preview: %s", exc)
         await q.message.reply_text(
-            "⚠️ Не вдалося надійно прочитати один із вихідних каналів. "
-            "Я не показую порожню підбірку, щоб випадково не пропустити об'єкти.\n\n"
-            "Спробуйте ще раз через кілька секунд. Якщо повториться — надішліть /source_status.",
+            collection_read_error_text(exc),
             reply_markup=home_keyboard(),
         )
         return
@@ -2006,9 +2198,7 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except LiveChannelReadError as exc:
         log.warning("Live channel read failed while regenerating: %s", exc)
         await q.edit_message_text(
-            "⚠️ Не вдалося надійно прочитати один із вихідних каналів. "
-            "Я не показую порожню підбірку, щоб випадково не пропустити об'єкти.\n\n"
-            "Спробуйте ще раз через кілька секунд. Якщо повториться — надішліть /source_status.",
+            collection_read_error_text(exc),
             reply_markup=home_keyboard(),
         )
         return
@@ -2082,7 +2272,7 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # text_html reconstructs Telegram formatting and text_link entities. The
     # previous implementation escaped message.text, which deliberately turned
     # every clickable "Детальніше" into plain black text.
-    edited_html = (message.text_html or html.escape(new_text)).strip()
+    edited_html = remove_overflow_notice((message.text_html or html.escape(new_text)).strip())
     edited_html = restore_collection_contact_links(edited_html)
     edited_html = restore_missing_detail_links(
         edited_html,
@@ -2162,6 +2352,12 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
             reply_markup=preview_keyboard(preview.get("token")),
         )
         return
+    if preview.get("mode") == "new":
+        try:
+            await ensure_publication_history(properties)
+        except LiveChannelReadError as exc:
+            await q.message.reply_text(collection_read_error_text(exc), reply_markup=preview_keyboard(preview.get("token")))
+            return
     unused = exclude_collected_properties(properties) if preview.get("mode") == "new" else properties
     if len(unused) != len(properties):
         await q.message.reply_text(
@@ -2358,19 +2554,21 @@ async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     now_local = datetime.now(TZ)
-    local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
-    threshold_utc = local_midnight.astimezone(timezone.utc)
+    threshold_utc = now_local.astimezone(timezone.utc) - timedelta(days=COLLECTION_LOOKBACK_DAYS)
     stats = publication_history_stats()
+    recovered = recovered_history_stats()
     lines = [
         f"🩺 Перевірка джерел | v{BOT_VERSION}",
         f"Збережених опублікованих підбірок: {stats['publications']}",
         f"Постів в історії: {stats['posts']}",
+        f"Відновлених підбірок із каналів: {recovered['publications']}",
+        f"Постів у відновленій історії: {recovered['posts']}",
         f"Період обох режимів: останній {COLLECTION_LOOKBACK_DAYS} день.",
     ]
-    if not stats["publications"]:
+    if not stats["publications"] and not recovered["publications"]:
         lines.append(
-            "Історія публікацій порожня. Поки підбірку не опубліковано через Publish, "
-            "свіжі та всі вільні можуть містити однакові об'єкти."
+            "Збережена історія поки порожня. Перед створенням свіжої підбірки бот "
+            "перевірить раніше опубліковані підбірки в каналах."
         )
 
     try:
@@ -2382,7 +2580,7 @@ async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for username in sorted(SOURCE_CHANNELS):
         try:
             live_items = await fetch_live_channel_objects(username, threshold_utc)
-            direct = f"direct: {len(live_items)}"
+            direct = f"direct: {len(filter_recent_properties(live_items))}"
         except Exception as exc:
             direct = f"direct: ERROR ({type(exc).__name__})"
 
@@ -2400,7 +2598,7 @@ async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     lines.append(
-        "\nЯкщо direct=ERROR і cache=0, бот не має надійного джерела старих постів за сьогодні. "
+        "\nЯкщо direct=ERROR і cache=0, бот не має надійного джерела постів за останній 21 день. "
         "Для стабільного cache бот має бути доданий у вихідні канали."
     )
     await update.effective_message.reply_text("\n".join(lines))

@@ -357,9 +357,10 @@ class TestCollectionBuilder(unittest.TestCase):
                 self.assertLess(text.index("📩"), text.index("📍 <b>Dublin 1</b>"))
                 self.assertEqual(text.count("https://wa.me/353894484275"), 1)
 
-    def test_collection_shows_hidden_count(self):
+    def test_collection_never_shows_hidden_count(self):
         text = main.build_collection([property_item(1)], hidden_count=4)
-        self.assertIn("Ще 4 пропозицій", text)
+        self.assertNotIn("Ще 4 пропозицій", text)
+        self.assertNotIn("не показано", text)
 
     def test_properties_rendered_excludes_trimmed(self):
         items = [property_item(1), property_item(2)]

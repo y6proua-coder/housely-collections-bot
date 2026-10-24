@@ -58,6 +58,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "ADMIN_IDS", {123}),
             patch.object(main.httpx, "AsyncClient", return_value=AsyncMock()),
             patch.object(main, "datetime", FixedDateTime),
+            patch.object(main, "ensure_publication_history", new=AsyncMock()),
         ]
         for p in self.patches:
             p.start()
