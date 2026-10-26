@@ -15,6 +15,7 @@ import httpx
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -50,8 +51,8 @@ SOURCE_CHANNELS = {
 }
 
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Dublin"))
-COLLECTION_LOOKBACK_DAYS = 21
-MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "25"))
+COLLECTION_LOOKBACK_DAYS = 28
+MAX_ITEMS = max(1, int(os.environ.get("MAX_ITEMS", "25")))
 VERIFY_SOURCE_POSTS = os.environ.get("VERIFY_SOURCE_POSTS", "true").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -76,7 +77,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("housely-collections")
-BOT_VERSION = "0.8.3"
+BOT_VERSION = "0.9.0"
 
 # Temporary preview/editor state. It is okay for this to reset on redeploy in MVP.
 PREVIEWS = {}
@@ -131,6 +132,8 @@ def init_db():
         }
         if "property_type" not in columns:
             conn.execute("ALTER TABLE property_posts ADD COLUMN property_type TEXT")
+        if "raw_html" not in columns:
+            conn.execute("ALTER TABLE property_posts ADD COLUMN raw_html TEXT")
 
         conn.execute(
             """
@@ -196,6 +199,9 @@ def init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_published_collection_url ON published_collection_posts(post_url)")
+        history_columns = {row["name"] for row in conn.execute("PRAGMA table_info(published_collection_posts)")}
+        if "watermark_eligible" not in history_columns:
+            conn.execute("ALTER TABLE published_collection_posts ADD COLUMN watermark_eligible INTEGER NOT NULL DEFAULT 1")
 
         # Reparse saved channel posts once after parser changes. This repairs
         # already stored rows too (for example, a room post previously
@@ -612,6 +618,40 @@ def is_inactive_property_post(text: str) -> bool:
     )
 
 
+def has_listing_contacts(text: str, text_html: str = "") -> bool:
+    """Require an actionable contact, excluding the channels' promotional footer."""
+    ignored = SOURCE_CHANNELS | {MAIN_CHANNEL.lstrip("@").lower()}
+    if any(handle.lower() not in ignored for handle in re.findall(r"(?<![\w@])@([A-Za-z][A-Za-z0-9_]{3,31})\b", text or "")):
+        return True
+    if re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text or ""):
+        return True
+    if re.search(r"(?<!\w)(?:\+\d{1,3}|00353|0[1-9])[\s().-]*(?:\d[\s().-]*){6,12}(?!\d)", text or ""):
+        return True
+    soup = BeautifulSoup(text_html or "", "html.parser")
+    urls = [node.get("href", "") for node in soup.select("a[href]")]
+    urls += re.findall(r"https?://[^\s<>]+", text or "")
+    for url in urls:
+        try:
+            parsed = urlsplit(html.unescape(url))
+        except ValueError:
+            continue
+        if parsed.scheme in {"tel", "mailto"} and parsed.path:
+            return True
+        if parsed.scheme == "tg" and parsed.netloc in {"user", "resolve"} and parsed.query:
+            return True
+        if parsed.hostname in {"wa.me", "api.whatsapp.com"} and (parsed.path.strip("/") or parsed.query):
+            return True
+        handle = parsed.path.strip("/")
+        if parsed.hostname in {"t.me", "telegram.me"} and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", handle) and handle.lower() not in ignored:
+            return True
+    return False
+
+
+def is_available_property(item):
+    text = item.get("raw_text") or ""
+    return not is_inactive_property_post(text) and has_listing_contacts(text, item.get("raw_html") or "")
+
+
 def looks_like_property_post(text: str) -> bool:
     """Reject collection/service posts while allowing manual property posts without Ref."""
     value = (text or "").strip()
@@ -687,6 +727,7 @@ def upsert_property_post(
     message_id: int,
     text: str,
     message_date: datetime,
+    text_html: str = "",
 ):
     """Save a Ref from the channel itself, regardless of who published it."""
     username = (username or "").lstrip("@").lower()
@@ -736,6 +777,7 @@ def upsert_property_post(
             local_date,
             message_date_utc.isoformat(),
             now_utc,
+            text_html,
         )
         if existing:
             conn.execute(
@@ -744,7 +786,7 @@ def upsert_property_post(
                 SET channel_id = COALESCE(?, channel_id),
                     ref = ?, location = ?, price = ?, description = ?,
                     property_type = ?, audience = ?, post_url = ?, raw_text = ?,
-                    local_date = ?, created_at_utc = ?, updated_at_utc = ?
+                    local_date = ?, created_at_utc = ?, updated_at_utc = ?, raw_html = ?
                 WHERE id = ?
                 """,
                 values + (existing["id"],),
@@ -756,9 +798,9 @@ def upsert_property_post(
                     channel_username, channel_id, message_id,
                     ref, location, price, description, property_type, audience,
                     post_url, raw_text, local_date,
-                    created_at_utc, updated_at_utc
+                    created_at_utc, updated_at_utc, raw_html
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (username, channel_id, message_id) + values[1:],
             )
@@ -785,6 +827,7 @@ def save_channel_post(update: Update):
         message_id=msg.message_id,
         text=msg.text or msg.caption or "",
         message_date=msg.date,
+        text_html=getattr(msg, "text_html", None) or getattr(msg, "caption_html", None) or "",
     )
     return saved or observed
 
@@ -864,6 +907,7 @@ def live_property_from_message(post):
             **parsed,
             "post_url": f"https://t.me/{post['username']}/{post['message_id']}",
             "raw_text": post["text"],
+            "raw_html": post.get("text_html", ""),
             "local_date": message_date_utc.astimezone(TZ).date().isoformat(),
             "created_at_utc": message_date_utc.isoformat(),
             "updated_at_utc": message_date_utc.isoformat(),
@@ -900,6 +944,7 @@ async def sync_recent_source_posts():
                     message_id=int(item["message_id"]),
                     text=item.get("raw_text") or item.get("description") or "",
                     message_date=message_date,
+                    text_html=item.get("raw_html") or "",
                 ):
                     saved += 1
             except Exception:
@@ -995,7 +1040,7 @@ def get_today_properties(apply_limit=True):
 
 
 def get_uncollected_properties(apply_limit=True):
-    """Return unused posts from the last 21 days; drafts do not consume posts."""
+    """Return available posts from the last four weeks after the last publication."""
     with db() as conn:
         rows = conn.execute(
             """
@@ -1005,13 +1050,13 @@ def get_uncollected_properties(apply_limit=True):
             """,
         ).fetchall()
 
-    properties = exclude_collected_properties(filter_recent_properties(_deduplicate_and_sort(rows)))
-    properties = [item for item in properties if not is_inactive_property_post(item["raw_text"])]
+    properties = filter_fresh_properties(filter_recent_properties(_deduplicate_and_sort(rows)))
+    properties = [item for item in properties if is_available_property(item)]
     return _with_limit(properties, apply_limit)
 
 
 def filter_recent_properties(properties, *, now_utc=None):
-    """Use the original source-post date, including the exact 21-day boundary."""
+    """Use the original source-post date, including the exact 28-day boundary."""
     now_utc = now_utc or datetime.now(timezone.utc)
     cutoff_utc = now_utc - timedelta(days=COLLECTION_LOOKBACK_DAYS)
     result = []
@@ -1054,6 +1099,24 @@ def exclude_collected_properties(properties):
     ]
 
 
+def filter_fresh_properties(properties):
+    cutoff = get_last_successful_publication_utc()
+    unused = exclude_collected_properties(properties)
+    if cutoff is None:
+        return unused
+    result = []
+    for item in unused:
+        try:
+            posted_at = datetime.fromisoformat(str(item["created_at_utc"]).replace("Z", "+00:00"))
+            if posted_at.tzinfo is None:
+                posted_at = posted_at.replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if posted_at.astimezone(timezone.utc) > cutoff:
+            result.append(item)
+    return result
+
+
 def collection_history_channels():
     return SOURCE_CHANNELS | {MAIN_CHANNEL.lstrip("@").lower()}
 
@@ -1091,6 +1154,8 @@ def save_published_collection(username, message_id, text, text_html, message_dat
     if not urls:
         return False
     known_refs = known_refs or {}
+    part = re.search(r"Частина\s+(\d+)\s*/\s*(\d+)", text or "", re.IGNORECASE)
+    watermark_eligible = not part or int(part[1]) == int(part[2])
     now_utc = datetime.now(timezone.utc).isoformat()
     if message_date.tzinfo is None:
         message_date = message_date.replace(tzinfo=timezone.utc)
@@ -1107,14 +1172,15 @@ def save_published_collection(username, message_id, text, text_html, message_dat
             conn.execute(
                 """
                 INSERT INTO published_collection_posts
-                    (channel_username, collection_message_id, post_url, ref, created_at_utc, imported_at_utc, deleted_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (channel_username, collection_message_id, post_url, ref, created_at_utc, imported_at_utc, deleted_at_utc, watermark_eligible)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel_username, collection_message_id, post_url) DO UPDATE SET
                     ref = COALESCE(excluded.ref, published_collection_posts.ref),
-                    imported_at_utc = excluded.imported_at_utc
+                    imported_at_utc = excluded.imported_at_utc,
+                    watermark_eligible = excluded.watermark_eligible
                 """,
                 (username, message_id, url, ref, message_date.astimezone(timezone.utc).isoformat(),
-                 now_utc, now_utc if undone else None),
+                 now_utc, now_utc if undone else None, int(watermark_eligible)),
             )
     return True
 
@@ -1322,6 +1388,8 @@ def classify_post_check_response(status_code: int, response_text: str, *, requir
         readable_text = readable_text or bool(text.strip())
         if is_inactive_property_post(text):
             return False
+        if require_text and not has_listing_contacts(text, node.decode_contents()):
+            return False
     if require_text and not readable_text:
         return None
 
@@ -1422,6 +1490,7 @@ def get_last_successful_publication_utc():
             SELECT MAX(cp.created_at_utc) AS created_at_utc
             FROM collection_publications AS cp
             WHERE cp.deleted_at_utc IS NULL
+              AND cp.mode NOT LIKE 'partial:%'
               AND EXISTS (
                   SELECT 1
                   FROM collection_publication_messages AS cpm
@@ -1430,7 +1499,17 @@ def get_last_successful_publication_utc():
               )
             """
         ).fetchone()
-    value = row["created_at_utc"] if row else None
+        observed = conn.execute(
+            """SELECT MAX(p.created_at_utc) AS created_at_utc
+               FROM published_collection_posts AS p
+               WHERE p.deleted_at_utc IS NULL AND p.watermark_eligible = 1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM collection_publication_messages AS m
+                     WHERE LOWER(LTRIM(m.destination, '@')) = p.channel_username
+                       AND m.message_id = p.collection_message_id
+                 )"""
+        ).fetchone()
+    value = max((value for value in (row["created_at_utc"], observed["created_at_utc"]) if value), default=None)
     if not value:
         return None
     try:
@@ -1612,8 +1691,7 @@ async def get_live_properties(mode: str):
         local_midnight = datetime.combine(now_local.date(), datetime.min.time(), tzinfo=TZ)
         threshold_utc = local_midnight.astimezone(timezone.utc)
     else:
-        # Both modes cover the same rolling 21-day window. Freshness is tracked
-        # separately by actual published items, never by the last collection date.
+        # Both modes cover four weeks; Fresh also starts after the last collection.
         threshold_utc = now_utc - timedelta(days=COLLECTION_LOOKBACK_DAYS)
 
     async def read_one_source(username):
@@ -1643,8 +1721,6 @@ async def get_live_properties(mode: str):
         # mirror created from real channel_post updates / startup sync.
         cached = get_cached_channel_objects(username, threshold_utc)
         if cached:
-            if mode == "new":
-                cached = exclude_collected_properties(cached)
             if mode in {"all", "new"}:
                 cached, _ = await remove_missing_source_posts(cached, require_confirmed=True)
             log.warning(
@@ -1672,19 +1748,18 @@ async def get_live_properties(mode: str):
     if mode == "today":
         candidates = [item for item in candidates if item.get("local_date") == today]
 
-    candidates = [item for item in candidates if not is_inactive_property_post(item.get("raw_text", ""))]
+    candidates = [item for item in candidates if is_available_property(item)]
     available_count = len(candidates)
     if mode == "new":
         await ensure_publication_history(candidates)
-        candidates = exclude_collected_properties(candidates)
+        candidates = filter_fresh_properties(candidates)
     log.info(
-        "Collection mode=%s | lookback_days=%s | available=%s | excluded_used=%s | matched=%s",
+        "Collection mode=%s | lookback_days=%s | available=%s | excluded_not_fresh=%s | matched=%s",
         mode, COLLECTION_LOOKBACK_DAYS, available_count, available_count - len(candidates), len(candidates),
     )
 
     properties = deduplicate_live_objects(candidates)
-    hidden_count = max(0, len(properties) - MAX_ITEMS)
-    return properties[:MAX_ITEMS], hidden_count, []
+    return properties, 0, []
 
 
 async def get_verified_properties(mode: str):
@@ -1815,6 +1890,65 @@ def build_collection(properties, hidden_count=0, mode="all"):
         return build_collection(properties[:-1], hidden_count + 1, mode=mode)
 
     return text
+
+
+def build_collection_parts(properties, mode="all"):
+    """Keep every eligible listing, respecting the limit separately in each message."""
+    remaining = list(properties)
+    parts = []
+    while remaining:
+        text = build_collection(remaining[:MAX_ITEMS], mode=mode)
+        shown = properties_rendered_in(text, remaining[:MAX_ITEMS])
+        if not shown or len(text) > 3900:
+            raise ValueError("A single listing cannot fit into a Telegram collection message")
+        parts.append({"text": text, "properties": shown})
+        shown_urls = {item["post_url"] for item in shown}
+        remaining = [item for item in remaining if item["post_url"] not in shown_urls]
+    if len(parts) > 1:
+        for index, part in enumerate(parts, 1):
+            first_line, rest = part["text"].split("\n", 1)
+            part["text"] = f"{first_line}\n🗂 Частина {index}/{len(parts)}\n{rest}"
+    return parts
+
+
+def preview_parts(preview):
+    return preview.get("parts") or [{"text": preview["text"], "properties": preview.get("properties", [])}]
+
+
+def refresh_preview_contents(preview):
+    parts = preview_parts(preview)
+    preview["text"] = "\n\n".join(part["text"] for part in parts)
+    by_url = {item["post_url"]: item for part in parts for item in part["properties"]}
+    preview["properties"] = list(by_url.values())
+
+
+def new_collection_preview(properties, mode):
+    preview = {"parts": build_collection_parts(properties, mode), "mode": mode, "token": secrets.token_hex(6)}
+    refresh_preview_contents(preview)
+    return preview
+
+
+async def reply_with_preview(message, preview):
+    parts = preview_parts(preview)
+    for index, part in enumerate(parts):
+        await telegram_with_retry(message.reply_text,
+            text=part["text"], parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=preview_keyboard(preview.get("token"), part_index=index if len(parts) > 1 else None,
+                                          controls=(index == len(parts) - 1)),
+        )
+
+
+async def telegram_with_retry(method, **kwargs):
+    for attempt in range(3):
+        try:
+            return await method(**kwargs)
+        except RetryAfter as exc:
+            retry_after = exc.retry_after
+            delay = retry_after.total_seconds() if isinstance(retry_after, timedelta) else float(retry_after)
+            if attempt == 2 or delay > 30:
+                raise
+            await asyncio.sleep(max(0, delay) + 0.1)
 
 
 def remove_overflow_notice(text):
@@ -1979,7 +2113,8 @@ def restore_standard_collection_formatting(edited_html: str, properties):
 
 
 def properties_rendered_in(text: str, properties):
-    return [item for item in properties if item["post_url"] in text]
+    urls = {node.get("href") for node in BeautifulSoup(text or "", "html.parser").select("a[href]")}
+    return [item for item in properties if item["post_url"] in urls]
 
 
 # =========================
@@ -2009,7 +2144,8 @@ async def current_preview(update: Update):
         await q.answer("Preview не знайдено. Створіть нову підбірку.", show_alert=True)
         return None
     token = preview.get("token")
-    callback_token = str(getattr(q, "data", "") or "").partition(":")[2]
+    fields = str(getattr(q, "data", "") or "").split(":")
+    callback_token = fields[1] if len(fields) > 1 else ""
     if token and callback_token != token:
         await q.answer(
             "Цей Preview застарів: ви вже створили іншу підбірку. Скористайтеся її кнопками або створіть нову.",
@@ -2019,11 +2155,16 @@ async def current_preview(update: Update):
     return preview
 
 
-def preview_keyboard(token=None):
+def preview_keyboard(token=None, part_index=None, controls=True):
+    edit_action = preview_action("edit_preview", token)
+    if part_index is not None:
+        edit_action += f":{part_index}"
+    if not controls:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit", callback_data=edit_action)]])
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Publish", callback_data=preview_action("publish_menu", token)),
-            InlineKeyboardButton("✏️ Edit", callback_data=preview_action("edit_preview", token)),
+            InlineKeyboardButton("✏️ Edit", callback_data=edit_action),
         ],
         [
             InlineKeyboardButton("🔄 Regenerate", callback_data=preview_action("regenerate", token)),
@@ -2091,9 +2232,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Housely Collections Bot v{BOT_VERSION}\n\n"
         "Бот читає об'єкти з @dublin_rent та @irelandrent, "
-        "прибирає дублікати й пропускає пости з позначкою недоступності.\n\n"
-        "🆕 Тільки свіжі пости - вільні об'єкти за останні 3 тижні, яких ще не було в опублікованих підбірках.\n"
-        "🏡 Усі вільні - усі доступні об'єкти за останні 3 тижні незалежно від попередніх підбірок.\n\n"
+        "прибирає дублікати й бере лише пости з контактами без позначки недоступності.\n\n"
+        "🆕 Тільки свіжі пости - доступні оголошення за останні 4 тижні, опубліковані після останньої підбірки та ще не використані.\n"
+        "🏡 Усі вільні - усі доступні оголошення за останні 4 тижні, навіть якщо вони вже були в підбірках.\n\n"
         "Якщо публічна сторінка Telegram "
         "тимчасово не віддає історію, бот використовує власне дзеркало постів каналів.",
         reply_markup=home_keyboard(),
@@ -2128,14 +2269,14 @@ async def create_collection_preview(update: Update, mode: str):
     if not properties:
         if mode == "new":
             empty_text = (
-                "Свіжих вільних постів за останні 3 тижні, яких ще не було в опублікованих "
-                "підбірках, поки немає.\n\n"
+                "Нових доступних оголошень після останньої опублікованої підбірки поки немає "
+                "(період пошуку - останні 4 тижні).\n\n"
                 "Preview, редагування, Regenerate або Cancel не змінюють "
                 "історію використаних постів."
             )
         else:
             empty_text = (
-                "У вихідних каналах немає вільних об'єктів за останні 3 тижні для підбірки."
+                "У вихідних каналах немає вільних об'єктів із контактами за останні 4 тижні."
             )
         await q.message.reply_text(
             empty_text,
@@ -2143,15 +2284,7 @@ async def create_collection_preview(update: Update, mode: str):
         )
         return
 
-    text = build_collection(properties, hidden_count, mode=mode)
-    visible_properties = properties_rendered_in(text, properties)
-    PREVIEWS[user.id] = {
-        "text": text,
-        "properties": visible_properties,
-        "hidden_count": hidden_count,
-        "mode": mode,
-        "token": secrets.token_hex(6),
-    }
+    PREVIEWS[user.id] = new_collection_preview(properties, mode)
     EDIT_WAITING.discard(user.id)
 
     if missing:
@@ -2160,12 +2293,7 @@ async def create_collection_preview(update: Update, mode: str):
             "видалених постів із каналів."
         )
 
-    await q.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(PREVIEWS[user.id]["token"]),
-    )
+    await reply_with_preview(q.message, PREVIEWS[user.id])
 
 
 async def create_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2204,24 +2332,16 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not properties:
         empty_text = (
-            "Нових невикористаних об'єктів за останні 3 тижні немає."
+            "Нових доступних оголошень після останньої підбірки немає (останні 4 тижні)."
             if mode == "new"
-            else "Немає вільних об'єктів за останні 3 тижні для підбірки."
+            else "Немає вільних об'єктів із контактами за останні 4 тижні."
         )
         PREVIEWS.pop(user.id, None)
         EDIT_WAITING.discard(user.id)
         await q.edit_message_text(empty_text, reply_markup=home_keyboard())
         return
 
-    text = build_collection(properties, hidden_count, mode=mode)
-    visible_properties = properties_rendered_in(text, properties)
-    PREVIEWS[user.id] = {
-        "text": text,
-        "properties": visible_properties,
-        "hidden_count": hidden_count,
-        "mode": mode,
-        "token": secrets.token_hex(6),
-    }
+    PREVIEWS[user.id] = new_collection_preview(properties, mode)
     EDIT_WAITING.discard(user.id)
 
     if missing:
@@ -2230,12 +2350,16 @@ async def regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "видалених постів із каналів."
         )
 
-    await q.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(PREVIEWS[user.id]["token"]),
-    )
+    parts = preview_parts(PREVIEWS[user.id])
+    if len(parts) == 1:
+        await q.edit_message_text(
+            parts[0]["text"], parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=preview_keyboard(PREVIEWS[user.id]["token"]),
+        )
+    else:
+        await q.edit_message_text("🔄 Оновлену підбірку надіслано нижче.")
+        await reply_with_preview(q.message, PREVIEWS[user.id])
 
 
 async def edit_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2245,13 +2369,22 @@ async def edit_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
-    if await current_preview(update) is None:
+    preview = await current_preview(update)
+    if preview is None:
         return
+
+    fields = str(getattr(q, "data", "") or "").split(":")
+    index = int(fields[2]) if len(fields) > 2 and fields[2].isdigit() else 0
+    if index >= len(preview_parts(preview)):
+        await q.answer("Цю частину не знайдено.", show_alert=True)
+        return
+    preview["edit_index"] = index
 
     EDIT_WAITING.add(user.id)
     await q.answer()
+    target = f"частини {index + 1}/{len(preview_parts(preview))}" if len(preview_parts(preview)) > 1 else "підбірки"
     await q.message.reply_text(
-        "✏️ Надішліть мені новий текст підбірки одним повідомленням.\n\n"
+        f"✏️ Надішліть мені новий текст {target} одним повідомленням.\n\n"
         "Після цього я покажу оновлений Preview."
     )
 
@@ -2267,7 +2400,12 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     EDIT_WAITING.discard(user.id)
-    preview = PREVIEWS.setdefault(user.id, {})
+    preview = PREVIEWS.get(user.id)
+    if preview is None:
+        return
+    parts = preview_parts(preview)
+    index = preview.pop("edit_index", 0)
+    part = parts[index]
 
     # text_html reconstructs Telegram formatting and text_link entities. The
     # previous implementation escaped message.text, which deliberately turned
@@ -2276,24 +2414,28 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     edited_html = restore_collection_contact_links(edited_html)
     edited_html = restore_missing_detail_links(
         edited_html,
-        preview.get("properties", []),
+        part.get("properties", []),
     )
     edited_html = restore_standard_collection_formatting(
         edited_html,
-        preview.get("properties", []),
+        part.get("properties", []),
     )
     edited_html = ensure_collection_footer(edited_html)
-    preview["text"] = edited_html
-    preview["properties"] = properties_rendered_in(
+    part["text"] = edited_html
+    part["properties"] = properties_rendered_in(
         edited_html,
-        preview.get("properties", []),
+        part.get("properties", []),
     )
+    preview["parts"] = parts
+    refresh_preview_contents(preview)
+    if len(parts) > 1:
+        await message.reply_text(f"Оновлено частину {index + 1}/{len(parts)}. Publish опублікує всю підбірку.")
 
     await message.reply_text(
         edited_html,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(preview.get("token")),
+        reply_markup=preview_keyboard(preview.get("token"), part_index=index if len(parts) > 1 else None),
     )
 
 
@@ -2347,7 +2489,7 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
     properties = preview.get("properties", [])
     if len(filter_recent_properties(properties)) != len(properties):
         await q.message.reply_text(
-            "⚠️ Частина постів уже старша за 3 тижні. "
+            "⚠️ Частина постів уже старша за 4 тижні. "
             "Натисніть Regenerate, щоб оновити підбірку.",
             reply_markup=preview_keyboard(preview.get("token")),
         )
@@ -2358,10 +2500,10 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
         except LiveChannelReadError as exc:
             await q.message.reply_text(collection_read_error_text(exc), reply_markup=preview_keyboard(preview.get("token")))
             return
-    unused = exclude_collected_properties(properties) if preview.get("mode") == "new" else properties
+    unused = filter_fresh_properties(properties) if preview.get("mode") == "new" else properties
     if len(unused) != len(properties):
         await q.message.reply_text(
-            "⚠️ Частина цих постів уже потрапила в іншу підбірку. "
+            "⚠️ Після створення Preview вже опубліковано іншу підбірку. "
             "Натисніть Regenerate, щоб оновити список свіжих постів.",
             reply_markup=preview_keyboard(preview.get("token")),
         )
@@ -2385,33 +2527,54 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
     sent_to = []
     sent_messages = []
     errors = []
+    parts = preview_parts(preview)
 
     for channel in destinations:
+        channel_messages = []
         try:
-            sent_message = await context.bot.send_message(
-                chat_id=channel,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
+            for index, part in enumerate(parts):
+                sent_message = await telegram_with_retry(context.bot.send_message,
+                    chat_id=channel, text=part["text"], parse_mode=ParseMode.HTML,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+                channel_messages.append({
+                    "destination": channel, "chat_id": sent_message.chat.id,
+                    "message_id": sent_message.message_id, "part_index": index,
+                })
             sent_to.append(channel)
-            sent_messages.append({
-                "destination": channel,
-                "chat_id": sent_message.chat.id,
-                "message_id": sent_message.message_id,
-            })
+            sent_messages.extend(channel_messages)
         except Exception as exc:
             log.exception("Failed to publish to %s", channel)
             errors.append(f"{channel}: {exc}")
+            removed = []
+            for message in channel_messages:
+                try:
+                    await context.bot.delete_message(chat_id=message["chat_id"], message_id=message["message_id"])
+                    removed.append(message)
+                except Exception as cleanup_error:
+                    if message_is_already_deleted_error(cleanup_error):
+                        removed.append(message)
+                    else:
+                        sent_messages.append(message)
+                        errors.append(f"{channel}: не вдалося видалити неповну частину підбірки.")
+            if removed:
+                try:
+                    cancelled_id = record_publication(user.id, "partial:" + preview.get("mode", "all"), text,
+                                                      properties_for_messages(parts, removed), removed)
+                    for message in get_active_publication_messages(cancelled_id):
+                        mark_publication_message_deleted(message["id"])
+                    finish_publication_undo(cancelled_id)
+                except Exception:
+                    log.exception("Could not record rolled-back collection messages")
 
     publication_id = None
     if sent_messages:
         try:
             publication_id = record_publication(
                 user.id,
-                preview.get("mode", "all"),
+                preview.get("mode", "all") if sent_to else "partial:" + preview.get("mode", "all"),
                 text,
-                preview.get("properties", []),
+                properties_for_messages(parts, sent_messages),
                 sent_messages,
             )
         except Exception as exc:
@@ -2422,6 +2585,8 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
             )
 
     result = "✅ Опубліковано:\n" + "\n".join(sent_to) if sent_to else "❌ Не вдалося опублікувати."
+    if sent_messages and not sent_to:
+        result = "⚠️ Підбірку опубліковано не повністю. Можна скасувати залишені частини кнопкою нижче."
     if errors:
         result += "\n\nПомилки:\n" + "\n".join(errors)
 
@@ -2433,6 +2598,12 @@ async def publish_to(update: Update, context: ContextTypes.DEFAULT_TYPE, destina
         result,
         reply_markup=(published_keyboard(publication_id) if publication_id else home_keyboard()),
     )
+
+
+def properties_for_messages(parts, messages):
+    indexes = {message.get("part_index", 0) for message in messages}
+    by_url = {item["post_url"]: item for index in indexes for item in parts[index]["properties"]}
+    return list(by_url.values())
 
 
 async def destination_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2457,12 +2628,7 @@ async def back_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer()
-    await q.message.reply_text(
-        preview["text"],
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-        reply_markup=preview_keyboard(preview.get("token")),
-    )
+    await reply_with_preview(q.message, preview)
 
 
 async def cancel_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2557,13 +2723,16 @@ async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     threshold_utc = now_local.astimezone(timezone.utc) - timedelta(days=COLLECTION_LOOKBACK_DAYS)
     stats = publication_history_stats()
     recovered = recovered_history_stats()
+    last_publication = get_last_successful_publication_utc()
     lines = [
         f"🩺 Перевірка джерел | v{BOT_VERSION}",
         f"Збережених опублікованих підбірок: {stats['publications']}",
         f"Постів в історії: {stats['posts']}",
         f"Відновлених підбірок із каналів: {recovered['publications']}",
         f"Постів у відновленій історії: {recovered['posts']}",
-        f"Період обох режимів: останній {COLLECTION_LOOKBACK_DAYS} день.",
+        f"Період обох режимів: останні {COLLECTION_LOOKBACK_DAYS} днів (4 тижні).",
+        (f"Свіжі пости після: {last_publication.astimezone(TZ).strftime('%d.%m.%Y %H:%M:%S')}"
+         if last_publication else "Першої успішної підбірки ще немає: свіжі пости перевіряються за останні 4 тижні."),
     ]
     if not stats["publications"] and not recovered["publications"]:
         lines.append(
@@ -2580,11 +2749,11 @@ async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for username in sorted(SOURCE_CHANNELS):
         try:
             live_items = await fetch_live_channel_objects(username, threshold_utc)
-            direct = f"direct: {len(filter_recent_properties(live_items))}"
+            direct = f"direct: {sum(is_available_property(item) for item in filter_recent_properties(live_items))}"
         except Exception as exc:
             direct = f"direct: ERROR ({type(exc).__name__})"
 
-        cached = get_cached_channel_objects(username, threshold_utc)
+        cached = [item for item in get_cached_channel_objects(username, threshold_utc) if is_available_property(item)]
         membership = "unknown"
         if bot_id is not None:
             try:
@@ -2598,7 +2767,7 @@ async def source_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     lines.append(
-        "\nЯкщо direct=ERROR і cache=0, бот не має надійного джерела постів за останній 21 день. "
+        "\nЯкщо direct=ERROR і cache=0, бот не має надійного джерела постів за останні 28 днів. "
         "Для стабільного cache бот має бути доданий у вихідні канали."
     )
     await update.effective_message.reply_text("\n".join(lines))
@@ -2647,7 +2816,7 @@ def main():
     app.add_handler(CallbackQueryHandler(create_all, pattern=r"^create_all$"))
     app.add_handler(CallbackQueryHandler(create_new, pattern=r"^create_new$"))
     app.add_handler(CallbackQueryHandler(regenerate, pattern=r"^regenerate(?::[0-9a-f]{12})?$"))
-    app.add_handler(CallbackQueryHandler(edit_preview, pattern=r"^edit_preview(?::[0-9a-f]{12})?$"))
+    app.add_handler(CallbackQueryHandler(edit_preview, pattern=r"^edit_preview(?::[0-9a-f]{12}(?::\d+)?)?$"))
     app.add_handler(CallbackQueryHandler(publish_menu, pattern=r"^publish_menu(?::[0-9a-f]{12})?$"))
     app.add_handler(CallbackQueryHandler(dest_other, pattern=r"^dest_other(?::[0-9a-f]{12})?$"))
     app.add_handler(

@@ -29,6 +29,7 @@ def property_item(
         "location": location,
         "price": price or f"€{900 + index:,}",
         "description": description or f"Кімната номер {index}",
+        "raw_text": f"Кімната\n📍 {location}\n💶 €900\nRef {index:07d}\nКонтакти: @team_housely",
         "property_type": property_type,
         "audience": audience,
         "post_url": f"https://t.me/dublin_rent/{100 + index}",
@@ -424,7 +425,7 @@ class TestDatabaseCleanup(unittest.TestCase):
                     "dublin_rent", item["channel_id"], item["message_id"],
                     item["ref"], item["location"], item["price"],
                     item["description"], item.get("audience"), item["post_url"],
-                    item.get("description", "raw"),
+                    item.get("raw_text", item.get("description", "raw")),
                     local_date, now, now,
                 ),
             )
@@ -548,7 +549,7 @@ class TestDatabaseCleanup(unittest.TestCase):
             {first["post_url"], second["post_url"]},
         )
 
-    def test_post_omitted_from_last_publication_stays_fresh(self):
+    def test_post_omitted_from_last_publication_is_before_fresh_cutoff(self):
         omitted = property_item(1)
         published = property_item(2)
         self.insert_item(omitted)
@@ -562,7 +563,7 @@ class TestDatabaseCleanup(unittest.TestCase):
         )
 
         remaining, _ = main.get_uncollected_properties(apply_limit=False)
-        self.assertEqual([row["ref"] for row in remaining], [omitted["ref"]])
+        self.assertEqual(remaining, [])
 
     def test_undo_makes_items_new_again(self):
         item = property_item(1)
@@ -669,6 +670,7 @@ class TestPublicChannelRecovery(unittest.IsolatedAsyncioTestCase):
             Для однієї особи з роботою<br>
             Вартість: €850<br>
             Ref 0000937
+            Контакти: @team_housely
           </div>
           <time datetime="2026-09-03T18:25:00+00:00"></time>
         </div>
@@ -1103,7 +1105,7 @@ class TestV072Reliability(unittest.IsolatedAsyncioTestCase):
             "🏡 Здається кімната в Dublin 8\n"
             "📍 Локація: Dublin 8\n"
             "💶 Оренда: €1,100\n"
-            "Ref 1234"
+            "Ref 1234\nКонтакти: @team_housely"
         )
         main.upsert_property_post("irelandrent", -1001, 77, text, now)
         with patch.object(

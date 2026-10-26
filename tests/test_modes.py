@@ -11,7 +11,7 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="housely-mode-tests-")
 import main
 
 
-LISTING = "🏠 Кімната\n📍 Dublin 8\n💶 €900\nRef 1234"
+LISTING = "🏠 Кімната\n📍 Dublin 8\n💶 €900\nRef 1234\nКонтакти: @team_housely"
 TEST_NOW = datetime(2026, 10, 19, 10, 0, tzinfo=timezone.utc)
 
 
@@ -77,13 +77,13 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
             [{"destination": "@main", "chat_id": -100, "message_id": message_id}],
         )
 
-    async def test_new_uses_actual_items_and_keeps_old_omitted_posts(self):
+    async def test_new_excludes_posts_before_last_collection_even_if_omitted(self):
         used, omitted = item(2), item(3)
         self.publish_record([used])
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[used, omitted])) as fetch:
             rows, _, _ = await main.get_live_properties("new")
-        self.assertEqual([row["ref"] for row in rows], [omitted["ref"]])
-        fetch.assert_awaited_once_with("irelandrent", TEST_NOW - timedelta(days=21))
+        self.assertEqual(rows, [])
+        fetch.assert_awaited_once_with("irelandrent", TEST_NOW - timedelta(days=28))
 
     async def test_first_new_collection_has_no_midnight_cutoff(self):
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[item(2)])):
@@ -96,7 +96,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[old])) as fetch:
             rows, _, _ = await main.get_live_properties("all")
         self.assertEqual(len(rows), 1)
-        fetch.assert_awaited_once_with("irelandrent", TEST_NOW - timedelta(days=21))
+        fetch.assert_awaited_once_with("irelandrent", TEST_NOW - timedelta(days=28))
 
     async def test_publication_in_all_mode_consumes_posts_for_fresh_mode(self):
         self.publish_record([item(2)], mode="all")
@@ -104,16 +104,17 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
             rows, _, _ = await main.get_live_properties("new")
         self.assertEqual(rows, [])
 
-    async def test_hidden_items_remain_fresh_for_next_collection(self):
+    async def test_selection_keeps_all_posts_even_when_part_size_is_one(self):
         with patch.object(main, "MAX_ITEMS", 1), patch.object(
             main, "fetch_live_channel_objects", new=AsyncMock(return_value=[item(2), item(3), item(4)])
         ):
             first, hidden, _ = await main.get_live_properties("new")
-            self.assertEqual(hidden, 2)
+            self.assertEqual(hidden, 0)
+            self.assertEqual(len(first), 3)
             self.publish_record(first)
             following, hidden, _ = await main.get_live_properties("new")
-            self.assertEqual(hidden, 1)
-            self.assertNotEqual(first[0]["post_url"], following[0]["post_url"])
+            self.assertEqual(hidden, 0)
+            self.assertEqual(following, [])
 
     def test_repost_with_previously_used_ref_is_not_fresh(self):
         self.publish_record([item(2)])
@@ -193,10 +194,10 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         buttons = [button for row in main.home_keyboard().inline_keyboard for button in row]
         self.assertEqual([button.callback_data for button in buttons], ["create_new", "create_all"])
 
-    async def test_both_modes_include_21_day_boundary_and_exclude_older_posts(self):
+    async def test_both_modes_include_28_day_boundary_and_exclude_older_posts(self):
         edge, expired, recent = item(2), item(3), item(4)
-        edge["created_at_utc"] = (TEST_NOW - timedelta(days=21)).isoformat()
-        expired["created_at_utc"] = (TEST_NOW - timedelta(days=21, seconds=1)).isoformat()
+        edge["created_at_utc"] = (TEST_NOW - timedelta(days=28)).isoformat()
+        expired["created_at_utc"] = (TEST_NOW - timedelta(days=28, seconds=1)).isoformat()
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(return_value=[edge, expired, recent])):
             for mode in ("all", "new"):
                 with self.subTest(mode=mode):
@@ -205,7 +206,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
 
     async def test_old_posts_are_excluded_before_item_limit(self):
         expired, recent = item(2), item(3)
-        expired["created_at_utc"] = (TEST_NOW - timedelta(days=22)).isoformat()
+        expired["created_at_utc"] = (TEST_NOW - timedelta(days=29)).isoformat()
         with patch.object(main, "MAX_ITEMS", 1), patch.object(
             main, "fetch_live_channel_objects", new=AsyncMock(return_value=[expired, recent])
         ):
@@ -214,7 +215,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hidden, 0)
 
     async def test_old_fallback_posts_are_not_verified_or_included(self):
-        main.upsert_property_post("irelandrent", -1001, 2, LISTING, TEST_NOW - timedelta(days=22))
+        main.upsert_property_post("irelandrent", -1001, 2, LISTING, TEST_NOW - timedelta(days=29))
         main.upsert_property_post("irelandrent", -1001, 3, LISTING.replace("1234", "1235"), TEST_NOW - timedelta(days=3))
         with patch.object(main, "fetch_live_channel_objects", new=AsyncMock(side_effect=main.LiveChannelReadError("blocked"))), \
              patch.object(main, "check_source_post", new=AsyncMock(return_value=True)) as check:
@@ -223,7 +224,7 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(check.await_count, 1)
 
     def test_source_edit_does_not_renew_original_post_date(self):
-        original_date = TEST_NOW - timedelta(days=22)
+        original_date = TEST_NOW - timedelta(days=29)
         main.upsert_property_post("irelandrent", -1001, 2, LISTING, original_date)
         main.upsert_property_post("irelandrent", -1001, 2, LISTING + "\nНові деталі", original_date)
         rows, _ = main.get_uncollected_properties(apply_limit=False)
@@ -233,20 +234,20 @@ class TestCollectionModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["created_at_utc"], original_date.isoformat())
         self.assertEqual(row["updated_at_utc"], TEST_NOW.isoformat())
 
-    async def test_publish_rejects_preview_that_has_aged_past_three_weeks(self):
+    async def test_publish_rejects_preview_that_has_aged_past_four_weeks(self):
         expired = item(2)
-        expired["created_at_utc"] = (TEST_NOW - timedelta(days=21, seconds=1)).isoformat()
+        expired["created_at_utc"] = (TEST_NOW - timedelta(days=28, seconds=1)).isoformat()
         main.PREVIEWS[123] = {"mode": "all", "properties": [expired], "text": "preview"}
         update = query_update()
         context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
         await main.publish_to(update, context, ["@main"])
         context.bot.send_message.assert_not_awaited()
-        self.assertIn("3 тижні", update.callback_query.message.reply_text.await_args.args[0])
+        self.assertIn("4 тижні", update.callback_query.message.reply_text.await_args.args[0])
 
     def test_recent_filter_compares_utc_offsets_and_rejects_invalid_dates(self):
         boundary, expired, invalid = item(2), item(3), item(4)
-        boundary["created_at_utc"] = "2026-09-28T11:00:00+01:00"
-        expired["created_at_utc"] = "2026-09-28T10:59:59+01:00"
+        boundary["created_at_utc"] = "2026-09-21T11:00:00+01:00"
+        expired["created_at_utc"] = "2026-09-21T10:59:59+01:00"
         invalid["created_at_utc"] = "bad date"
         rows = main.filter_recent_properties([boundary, expired, invalid], now_utc=TEST_NOW)
         self.assertEqual([row["message_id"] for row in rows], [2])

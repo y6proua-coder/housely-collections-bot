@@ -17,7 +17,7 @@ def listing(number, days=1):
         "post_url": f"https://t.me/irelandrent/{number}", "message_id": number,
         "channel_username": "irelandrent", "location": "Dublin 1", "price": "€900",
         "description": "Кімната", "property_type": "Кімната", "audience": None,
-        "raw_text": f"Кімната\n📍 Dublin 1\n💶 €900\nRef {number}",
+        "raw_text": f"Кімната\n📍 Dublin 1\n💶 €900\nRef {number}\nКонтакти: @team_housely",
         "local_date": date.astimezone(main.TZ).date().isoformat(), "created_at_utc": date.isoformat(),
     }
 
@@ -52,9 +52,9 @@ class TestRecoveredPublicationHistory(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_empty_database_recovers_old_collections_and_modes_have_different_sets(self):
-        used, unused, expired, closed = listing(2417), listing(2428), listing(2320, days=22), listing(2458)
+        used, unused, expired, closed = listing(2417, days=3), listing(2428), listing(2320, days=29), listing(2458)
         closed["raw_text"] += "\n🔴 БІЛЬШЕ НЕ ДОСТУПНО 🔴"
-        published = collection_post([used])
+        published = collection_post([used], days=2)
 
         async def fetch_history(username, threshold):
             return [published] if username == "main_test" else []
@@ -81,7 +81,7 @@ class TestRecoveredPublicationHistory(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(conn.execute("SELECT value FROM bot_settings WHERE key='collection_history_checked_at'").fetchone())
 
     async def test_old_collections_outside_recovery_window_are_not_imported(self):
-        old = collection_post([listing(2417)], days=22)
+        old = collection_post([listing(2417)], days=29)
         with patch.object(main, "fetch_channel_messages", new=AsyncMock(return_value=[old])):
             await main.ensure_publication_history()
         self.assertEqual(main.recovered_history_stats()["posts"], 0)

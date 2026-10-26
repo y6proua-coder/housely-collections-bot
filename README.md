@@ -1,177 +1,99 @@
 # Housely Collections Bot
 
-## v0.8.3 - recover the previously published links and remove overflow notices
+## v0.9.0
 
-Fresh and All use the same source-post age window (the last 21 days) and both exclude posts marked `🔴 БІЛЬШЕ НЕ ДОСТУПНО 🔴`. All includes eligible posts even if they appeared in earlier collections. Fresh excludes links and known Refs used by earlier, non-cancelled published collections.
+The bot reads property listings from `@irelandrent` and `@dublin_rent`.
+It offers two collection modes:
 
-Connecting a persistent volume preserves future history, but does not recreate history that was lost before the volume existed. Before generating Fresh, this release also reads actual published collections in `MAIN_CHANNEL`, `DUBLIN_CHANNEL` and `IRELAND_CHANNEL` for the last 21 days. It restores their source-post hyperlinks to a separate SQLite history table and uses those links for exclusion. Recognizable collections copied into a channel manually are supported too, provided their source-post links remain intact. Channel updates observe newly published collections immediately; public-history checks are reused for at most 60 seconds. Drafts and private previews are never imported as published collections.
+| Mode | Selection |
+| --- | --- |
+| 🏡 Усі вільні | Every available listing originally published in either source channel during the last 28 days, including listings used in earlier collections. |
+| 🆕 Тільки свіжі пости | Available listings from that same 28-day window, originally published after the latest successfully published collection and not previously used in an active collection. |
 
-The recovery reader preserves hyperlink targets from Telegram HTML instead of seeing only the visible `Детальніше` labels. Collection headings plus links to configured property source channels identify a collection. Ordinary property adverts, contacts and unrelated channels are not imported. Failed or incomplete channel-history reads stop Fresh with a specific history error; All remains independent of that check. This avoids silently claiming previously used posts are fresh when history is unavailable. A locally undone collection stays cancelled even if the same public page is later read from a cache.
+The period is a rolling four weeks, not the current calendar month. Exactly 28 days old is included; older listings are excluded. The original source-post date is used. Editing an advert does not make it fresh.
 
-The line `➕ Ще … пропозицій не показано в цій підбірці` has been removed from generated messages in both modes. Edit also removes that old line if pasted back into a new preview. The existing `MAX_ITEMS` and message-length limits remain in effect; this update removes the notice and does not change collection size.
+Before the first successful collection, Fresh can include all eligible unused listings within the four-week window. Creating, editing, regenerating or cancelling a preview does not move the publication cutoff. Both All and Fresh publications move it when publication succeeds.
 
-`/source_status` reports locally recorded history and channel-recovered history separately. Its direct/cache source counts now use the same 21-day period as the two collection modes. Keep the volume mounted at `/app/data` and do not delete `collections.db`. On the first Fresh request after upgrade, channel-history recovery can take longer than an ordinary regeneration. This archive contains code; it does not itself deploy to Railway or publish any Telegram messages.
+## Availability
 
-Tests include an empty database, recovery from old channel collections, Fresh/All selection, age and availability filters, duplicate imports, cancellation, persistence after reopening the database, unreadable history and removal of the overflow notice.
+An available advert must contain an actionable contact: a Telegram manager handle or link, a telephone number, WhatsApp link, or email address. Links advertising only the configured property channels or the main channel do not count as contact details. Contact links hidden behind formatted text are preserved in the public-page reader and SQLite cache.
 
-## v0.8.2 - correct preview buttons and publication history diagnostics
+The marker `🔴 БІЛЬШЕ НЕ ДОСТУПНО 🔴` excludes a post, even if the previous advert and some old contact details remain below it. Bold formatting, different letter case, repeated spaces, and the marker appearing anywhere in the caption are supported. Existing Ukrainian, Russian and English closed-status variants remain supported.
 
-Fixed a reproducible bug: after creating a Fresh preview and then an All preview (or the reverse), Publish on the older message used the most recently created preview. All preview, edit, regenerate, cancel and destination buttons now carry the preview's own identity. An outdated button shows an alert instead of acting on another collection. Regenerate without a valid preview no longer silently switches to All. Starting a new preview cancels a pending edit of the previous one.
+Ordinary adverts are identified by property type, location, price and/or Ref. Collection posts and service advertisements are not treated as property listings.
 
-The difference between the modes depends on **successful publication through Publish**. If all eligible posts are unused, both modes correctly contain the same listings; creating, viewing or cancelling a preview does not use its posts. After publishing, those posts remain in All and are excluded from Fresh. Undo can restore them while they remain within the 21-day window. Publication history must remain in the same persistent `/app/data/collections.db` across deployments.
+Availability is checked again against the current source caption immediately before publication. A removed contact, a closed-status marker, or a deleted source post stops publication and asks the admin to regenerate. An unreadable source is not assumed available.
 
-`/source_status` now shows the running version, the number of saved active collections and the number of posts in their history. If those counts unexpectedly return to zero after a restart, check that the existing persistent data volume is still mounted. A history-save failure after publication is now reported explicitly instead of being described only as an Undo-button error. Source-selection logs also show the number of previously used posts excluded by Fresh.
+## Full collections and editing
 
-An end-to-end regression test creates a preview, opens its publishing menu, publishes through its destination callback, reopens the database and confirms that Fresh excludes the published posts while All still contains them. No live Telegram messages are sent by tests.
+Every eligible listing is included in the preview. A large collection is split into several Telegram messages with a short `Частина 1/N` label. `MAX_ITEMS` controls the maximum number of listings per message, not the number of listings in the whole collection. Message-length limits can create smaller parts.
 
-## Current selection rules
+Each part has its own Edit button. Publish, Regenerate and Cancel are shown on the final part. Publish sends the whole collection; Edit changes only the selected part. Existing previews are protected by their own token so an older button cannot act on a newer collection.
 
-Both modes use a rolling **21-day window** from the time a collection is generated. A post published exactly 21 days ago is included; older posts are excluded. The original Telegram publication date is used, so editing a post does not renew its age. The window is checked again before publishing a saved preview.
+The line `➕ Ще … пропозицій не показано в цій підбірці` is never generated. Edit also removes it if it is pasted from an older collection.
 
-The main menu now has exactly two options:
+Telegram rate-limit responses are retried after their specified delay. If a later part fails, the bot attempts to remove the incomplete messages in that destination. Any remaining partial messages are recorded as used, but an incomplete collection does not move the cutoff for Fresh. A collection published completely in at least one selected destination counts as successful.
 
-- `🆕 Тільки свіжі пости`: available source posts from the last 21 days that have not appeared in a successfully published, non-cancelled collection. A post can be older than today or the last collection, within that window. Existing publication history is reused, including posts published through the old Today mode or the new All mode. Identity is checked by Ref and Telegram post URL; a repost with an already used Ref is not fresh.
-- `🏡 Усі вільні`: available posts from the last 21 days, including posts used in earlier collections. This replaces the Today button. Older Today buttons also open All.
+Undo removes every recorded Telegram message in the collection. Listings are eligible again only if they remain within the current window, are available, and are not covered by another active collection or its date cutoff.
 
-Both modes scan source history back to the 21-day cutoff, ignore duplicate listings and reject posts marked unavailable even when the original advert remains in the channel. The team's exact marker `🔴 БІЛЬШЕ НЕ ДОСТУПНО 🔴` is recognized, including bold formatting, different letter case and repeated spaces. It may appear at the top, in the middle or at the end of the post or photo caption. Other supported status lines include `Більше недоступно`, `Больше не доступно`, `Об'єкт більше недоступний`, `Не доступно`, `Здано`, `Сдано` and `No longer available`. An amenity detail such as `Інтернет недоступний` does not close the listing.
+## Publication history
 
-Freshness is recorded only after Telegram accepts publication to at least one destination. Preview, Edit, Regenerate, Cancel, hidden items and lines removed from a preview do not consume listings. Undo restores eligibility only when the post is no longer used by another active collection. Once a collection is published and recorded, its preview is cleared to prevent accidental repeated publication.
+Publication history is stored in SQLite at `DATA_DIR/collections.db`, normally `/app/data/collections.db`. Keep the existing persistent volume mounted at `/app/data`. An ordinary code update must not delete or replace that database.
 
-Before publication the bot checks the current source-post text again. If a listing has become unavailable, been deleted, or been used in another collection while a Fresh preview was open, publication stops and the admin is asked to regenerate. If current availability cannot be read, publication stops for a retry.
+The bot also recovers source-post links from recognizable, actually published collections in `MAIN_CHANNEL`, `DUBLIN_CHANNEL` and `IRELAND_CHANNEL` for the last 28 days. This recovers history lost before a persistent disk was attached and supports collections copied into a channel manually with their links intact. Private previews are never imported.
 
-Direct public channel history remains the primary source. Cached fallback listings are checked against their current Telegram captions before use in either mode, even if the legacy `VERIFY_SOURCE_POSTS` switch is disabled. Unreadable current captions cause a source error instead of being assumed available. The cache may cover only posts the bot previously received or synced; if a public-history read fails, it cannot recover older posts absent from that cache.
+Public-history checks are reused for at most 60 seconds. Failed or incomplete history reads stop Fresh with a specific error; All can still be used independently. Recovered multipart collections move the cutoff on their final part. Locally recorded publications are authoritative for completion and cancellation.
 
-Pagination counts media-only posts, detects a stalled scan and refuses a silently truncated direct scan. `LIVE_SOURCE_MAX_PAGES` defaults to `200`. Update an explicitly configured value of `20` to `200` if the 21-day source history needs more pages. The default startup mirror lookback is now `SOURCE_SYNC_LOOKBACK_HOURS=504` (21 days); update an explicit old value of `72` to `504` for the same fallback coverage.
+Database additions are applied automatically at startup while preserving existing records. No database reset is required.
 
-The existing `MAX_ITEMS=25` and Telegram message-size limit still apply to each collection. Additional matches are not mentioned in the published text. Posts omitted by these limits remain eligible for the next Fresh collection; All always considers the full available set again.
-
-Keep the existing `/app/data/collections.db` and persistent volume. No reset, new token or new database is required. This archive updates code only; deploying it is a separate step.
-
-Validation: `python -m pytest -q` (install requirements and pytest first). Tests cover both modes, the exact 21-day boundary, exclusion before item limits, original publication dates after edits, old unused posts within the window, existing publication history, hidden items, Undo, status edits, cache checks, preview expiry, publication-time checks and history pagination.
-
-## v0.7.3 — updated collection message templates
-
-Both collection modes now use the approved Ukrainian intro, with different headlines:
-
-- **Today:** `🏡 Всім привіт! Зібрали для вас підбірку новинок за сьогодні!`
-- **Only new:** `🆕 Нові пропозиції житла вже тут!`
-
-The introduction above the generated property list is identical in both modes: viewing prompt, invitation to contact Housely about a viewing, and clickable links to `https://t.me/team_housely` and WhatsApp `+353 89 448 4275` (`https://wa.me/353894484275`). The existing end-of-post channel footer remains unchanged. Property selection, collection history, Undo and database settings are unchanged.
-
-
-## v0.7.2 — channel reliability fix
-
-This version focuses on the exact failure seen after v0.7.1: the bot could show **“Сьогодні ... немає об'єктів”** even when the source channels contained listings.
-
-### Main source logic
-
-`📅 Підбірка за сьогодні` and `🆕 Тільки нові об'єкти` use the Telegram source channels:
-
-- `@dublin_rent`
-- `@irelandrent`
-
-The public Telegram channel history is the primary source. The SQLite table is only a fallback mirror of real Telegram channel posts and publication/Undo history.
-
-### Reliability changes in v0.7.2
-
-- Telegram public history is retried up to 3 times when it returns an empty/anti-bot page or a temporary HTTP error.
-- An unreadable Telegram page is no longer treated as proof that there are zero objects. If both the direct source and the channel mirror are unavailable, the bot shows a source error instead of a false empty collection.
-- At startup the bot warms the fallback mirror from the last 72 hours of public channel history.
-- Normal `channel_post` and `edited_channel_post` updates keep the mirror fresh after startup.
-- Manual property posts without `Ref` are included when they have a recognizable property type, location and price.
-- Posts with a real Housely `Ref` are accepted even if a future/new property wording is not yet recognized by the type parser.
-- Repeated real `Ref` values are de-duplicated and only the newest Telegram post is kept.
-- Manual posts without `Ref` are de-duplicated by normalized post content.
-- Standard Housely footer text (`Переглядай актуальні пропозиції...`) no longer causes a normal listing to be rejected.
-- Generated collection posts are ignored and cannot be parsed back as listings.
-- Posts edited to `Не доступно`, `Недоступно`, `Неактуально`, `Здано/Сдано`, etc. are removed from the fallback mirror instead of remaining as stale listings.
-- `📍 Lucan`, `📍 Malahide, Co. Dublin`, etc. are recognized even when the location line has no `Локація:` label.
-- `Bed-space` / `bed space` / `ліжко-місце` variants are recognized.
-- Telegram caption markup is supported in addition to the usual message-text markup.
-- A partial collection is not produced if one source channel is unreadable and no safe fallback exists for that channel.
-
-## Diagnostic command
-
-Admin-only command:
-
-`/source_status`
-
-It reports, for each source channel:
-
-- how many listings can be read directly from Telegram today;
-- how many are available in the fallback channel-post mirror;
-- whether Telegram reports the bot as available in that source channel.
-
-If the result is `direct: ERROR` and `cache: 0`, the bot deliberately refuses to pretend that the channel is empty.
-
-## Important for stable fallback
-
-For the fallback mirror to receive future `channel_post` updates reliably, add the bot to both source channels (`@dublin_rent` and `@irelandrent`). In practice a Telegram bot is normally added to a channel as an administrator. It does not need to publish there just for the mirror logic, but it must be present so Telegram can deliver channel post updates.
-
-The direct public-history reader still works independently when Telegram allows the Railway server to read the public `/s/` pages.
-
-## Railway variables
+## Configuration
 
 Required:
 
 - `BOT_TOKEN`
-- `ADMIN_IDS`
+- `ADMIN_IDS` as comma-separated Telegram user IDs, or the older `ADMIN_ID`
+
+Default channels and storage:
+
 - `MAIN_CHANNEL=@arpireland1`
-- `FOOTER_CHANNEL_URL=https://t.me/arpireland1`
 - `DUBLIN_CHANNEL=@dublin_rent`
 - `IRELAND_CHANNEL=@irelandrent`
-- `TIMEZONE=Europe/Dublin`
-- `MAX_ITEMS=25`
+- `FOOTER_CHANNEL_URL=https://t.me/arpireland1`
 - `DATA_DIR=/app/data`
+- `TIMEZONE=Europe/Dublin`
+- `MAX_ITEMS=25` per message
 
-Recommended source settings (defaults already match these values):
+Source reading:
 
 - `LIVE_SOURCE_MAX_PAGES=200`
 - `LIVE_SOURCE_TIMEOUT=8`
 - `LIVE_SOURCE_RETRIES=3`
 - `LIVE_SOURCE_RETRY_DELAY=0.8`
 - `SOURCE_SYNC_ENABLED=true`
-- `SOURCE_SYNC_LOOKBACK_HOURS=504`
-
-Legacy source-post verification settings can remain:
-
-- `VERIFY_SOURCE_POSTS=true`
+- `SOURCE_SYNC_LOOKBACK_HOURS=672` (28 days)
 - `POST_CHECK_TIMEOUT=8`
 - `POST_CHECK_CONCURRENCY=8`
-- `SOURCE_SYNC_TIMEOUT=6`
 
-## Persistent database
+If an older deployment explicitly sets the mirror lookback to 72 or 504 hours, set it to 672 for the full four-week fallback coverage. The public source reader always uses the fixed 28-day selection window.
 
-Keep the Railway Volume mounted at:
+Add the bot to the property source channels so Telegram delivers new and edited channel posts. Public channel history remains the primary read source; the SQLite mirror is a fallback when public pages cannot be read.
 
-`/app/data`
+## Diagnostics
 
-Do **not** delete the existing volume or `collections.db` when deploying this update. Publication history and Undo depend on it, and valid channel-post mirror rows are useful as a fallback.
+Admin commands:
 
-## Deployment test
+- `/start`: menu and running version.
+- `/id`: the caller's Telegram ID.
+- `/source_status`: running version, saved and recovered publication counts, Fresh cutoff, and direct/cache listing counts for the last 28 days.
 
-1. Deploy this version without deleting the Railway Volume.
-2. Send `/source_status` to the bot.
-3. Press `📅 Підбірка за сьогодні`.
-4. Confirm repeated `Ref` values appear once.
-5. Confirm manual posts without `Ref` are included when they contain property type + location + price.
-6. If a source cannot be read, the bot must show a source error rather than “0 objects”.
-7. Publish a new listing after deployment and verify it appears in the next collection.
+Runtime selection logs show the mode, lookback, available count and number of posts excluded from Fresh.
 
-## Test suite
+## Validation
 
-The release was checked with the existing regression suite plus new reliability tests for:
+Install application requirements and pytest, then run:
 
-- public-page retry and recovery;
-- anti-bot/empty-page handling;
-- direct-source failure with and without cache;
-- partial source failure;
-- manual posts without Ref;
-- duplicate Ref handling;
-- standard Housely footer parsing;
-- unavailable edited posts;
-- pin-only locations;
-- bed-space spelling;
-- caption markup;
-- current multi-room Housely listing format;
-- startup mirror warm-up.
+```bash
+python -m pytest -q
+```
+
+The suite covers four-week boundaries, both source channels, actionable contacts, closed statuses, original dates after edits, publication cutoffs, recovered history, multipart previews and edits, publishing and Undo, failed-part cleanup, retries, database migration and persistence. Tests send no live Telegram messages.
